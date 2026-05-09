@@ -463,6 +463,180 @@ func (h *Handler) upsertAggregateCheckRun(
 		"per_database_checks", len(dbChecks))
 }
 
+// postPassingAggregates posts a passing aggregate check for each allowed environment.
+// Called when this instance has no work to do for a PR — either because the PR doesn't
+// touch schema files, or because the databases don't have environments this instance
+// manages. Without this, branch protection would block indefinitely waiting for a
+// check that would never come.
+func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, title, summary string) {
+	config := h.service.Config()
+
+	type envCheck struct {
+		name        string
+		environment string
+	}
+
+	var checks []envCheck
+	if len(config.AllowedEnvironments) > 0 {
+		for _, env := range config.AllowedEnvironments {
+			checks = append(checks, envCheck{
+				name:        aggregateCheckNameForEnv(env),
+				environment: env,
+			})
+		}
+	} else {
+		checks = append(checks, envCheck{
+			name:        aggregateCheckName,
+			environment: aggregateSentinel,
+		})
+	}
+
+	h.logger.Debug("posting passing aggregates", "repo", repo, "pr", pr, "head_sha", headSHA, "count", len(checks))
+
+	for _, ec := range checks {
+		checkName := ec.name
+
+		opts := ghclient.CheckRunOptions{
+			Name:       checkName,
+			Status:     checkStatusCompleted,
+			Conclusion: checkConclusionSuccess,
+			Output: &ghclient.CheckRunOutput{
+				Title:   title,
+				Summary: summary,
+			},
+		}
+
+		existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, ec.environment, aggregateSentinel, aggregateSentinel)
+		if err != nil {
+			h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "env", ec.environment, "error", err)
+			continue
+		}
+
+		// Skip if already passing for this SHA
+		if existing != nil && existing.HeadSHA == headSHA && existing.Conclusion == checkConclusionSuccess {
+			h.logger.Debug("passing aggregate already exists", "repo", repo, "pr", pr, "check_name", checkName)
+			continue
+		}
+
+		var checkRunID int64
+		if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
+			if err := client.UpdateCheckRun(ctx, repo, existing.CheckRunID, opts); err != nil {
+				h.logger.Error("failed to update passing aggregate", "error", err)
+				continue
+			}
+			checkRunID = existing.CheckRunID
+		} else {
+			id, err := client.CreateCheckRun(ctx, repo, headSHA, opts)
+			if err != nil {
+				h.logger.Error("failed to create passing aggregate", "error", err)
+				continue
+			}
+			checkRunID = id
+		}
+
+		aggCheck := &storage.Check{
+			Repository:   repo,
+			PullRequest:  pr,
+			HeadSHA:      headSHA,
+			Environment:  ec.environment,
+			DatabaseType: aggregateSentinel,
+			DatabaseName: aggregateSentinel,
+			CheckRunID:   checkRunID,
+			HasChanges:   false,
+			Status:       checkStatusCompleted,
+			Conclusion:   checkConclusionSuccess,
+		}
+		if err := h.service.Storage().Checks().Upsert(ctx, aggCheck); err != nil {
+			h.logger.Error("failed to store passing aggregate check", "error", err)
+		}
+
+		action := "created"
+		if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
+			action = "updated"
+		}
+		h.logger.Info("posted passing aggregate",
+			"repo", repo, "pr", pr, "check_name", checkName, "env", ec.environment, "action", action)
+	}
+}
+
+// postFailingAggregates posts a failing aggregate check for each allowed environment
+// that has errors. Called when all environments fail during planning so branch
+// protection shows a clear failure instead of waiting indefinitely.
+func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string) {
+	config := h.service.Config()
+
+	type envCheck struct {
+		name        string
+		environment string
+	}
+
+	var checks []envCheck
+	if len(config.AllowedEnvironments) > 0 {
+		for _, env := range config.AllowedEnvironments {
+			if _, hasError := errors[env]; hasError {
+				checks = append(checks, envCheck{
+					name:        aggregateCheckNameForEnv(env),
+					environment: env,
+				})
+			}
+		}
+	} else {
+		checks = append(checks, envCheck{
+			name:        aggregateCheckName,
+			environment: aggregateSentinel,
+		})
+	}
+
+	for _, ec := range checks {
+		// Build summary from the error for this environment
+		summary := "Plan failed"
+		if errMsg, ok := errors[ec.environment]; ok {
+			summary = errMsg
+		} else if len(errors) > 0 {
+			// Single-instance mode: use first error
+			for _, msg := range errors {
+				summary = msg
+				break
+			}
+		}
+
+		opts := ghclient.CheckRunOptions{
+			Name:       ec.name,
+			Status:     checkStatusCompleted,
+			Conclusion: checkConclusionFailure,
+			Output: &ghclient.CheckRunOutput{
+				Title:   "Plan failed",
+				Summary: summary,
+			},
+		}
+
+		id, err := client.CreateCheckRun(ctx, repo, headSHA, opts)
+		if err != nil {
+			h.logger.Error("failed to create failing aggregate", "repo", repo, "pr", pr, "error", err)
+			continue
+		}
+
+		aggCheck := &storage.Check{
+			Repository:   repo,
+			PullRequest:  pr,
+			HeadSHA:      headSHA,
+			Environment:  ec.environment,
+			DatabaseType: aggregateSentinel,
+			DatabaseName: aggregateSentinel,
+			CheckRunID:   id,
+			HasChanges:   false,
+			Status:       checkStatusCompleted,
+			Conclusion:   checkConclusionFailure,
+		}
+		if err := h.service.Storage().Checks().Upsert(ctx, aggCheck); err != nil {
+			h.logger.Error("failed to store failing aggregate check", "error", err)
+		}
+
+		h.logger.Info("posted failing aggregate",
+			"repo", repo, "pr", pr, "check_name", ec.name, "env", ec.environment)
+	}
+}
+
 // computeAggregate determines the aggregate conclusion and status from per-database checks.
 func computeAggregate(checks []*storage.Check) (conclusion, status string) {
 	// in_progress takes precedence — the aggregate should show running

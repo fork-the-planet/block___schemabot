@@ -101,7 +101,7 @@ package tern
 import (
 	"context"
 	"fmt"
-	"net/url"
+	"net"
 	"time"
 
 	"google.golang.org/grpc"
@@ -144,19 +144,15 @@ type Config struct {
 // hostname only (without the port) so that intermediaries route based on
 // hostname rather than host:port.
 func NewGRPCClient(config Config) (*GRPCClient, error) {
-	// Parse the address to extract the hostname for the :authority header.
-	// url.Parse requires a scheme, so prepend a placeholder if missing.
-	parseTarget := config.Address
-	if u, err := url.Parse("//" + parseTarget); err == nil && u.Hostname() != "" {
-		parseTarget = u.Hostname()
-	} else {
-		return nil, fmt.Errorf("parse address %s: %w", config.Address, err)
+	host, _, err := net.SplitHostPort(config.Address)
+	if err != nil {
+		return nil, fmt.Errorf("split host:port from address %s: %w", config.Address, err)
 	}
 
 	conn, err := grpc.NewClient(
 		config.Address,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithAuthority(parseTarget),
+		grpc.WithAuthority(host),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", config.Address, err)

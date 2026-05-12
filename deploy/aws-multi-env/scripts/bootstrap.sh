@@ -16,7 +16,11 @@ set -euo pipefail
 # 4. App Runner service
 
 REGION="us-west-2"
-export AWS_PROFILE="${AWS_PROFILE:-schemabot-deployer}"
+if [ -z "${AWS_PROFILE:-}" ]; then
+    echo "❌ AWS_PROFILE is not set."
+    echo "   Example: export AWS_PROFILE=my-profile"
+    exit 1
+fi
 
 AUTO_APPROVE=""
 while getopts "y" opt; do

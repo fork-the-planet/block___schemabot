@@ -56,6 +56,10 @@ CI mirrors local dev exactly — each job runs the corresponding make target.
 - **Copilot review comments:** Copilot auto-reviews every PR. Its suggestions are generally good — incorporate them when valid. But always verify they are contextually correct before implementing; don't blindly apply them. After addressing a comment (commit + push), resolve the review thread.
 - **Never post PR comments without explicit approval.** Do not reply to review comments, post explanations, or resolve threads automatically. Show the user what you want to say and let them decide. PR comments are visible to all reviewers and represent the author's voice — agents should not speak on behalf of the author without permission.
 
+### Commit Message Scopes
+
+Use `fix(github)` or `feat(github)` for changes that affect the GitHub PR UX (comments, check runs, reactions) — even if the code lives in `pkg/webhook/`. The scope describes *what the user sees*, not the package name.
+
 ### Commit Checklist (MANDATORY — do these every time before `git commit`)
 
 1. `gofmt -w` on all changed `.go` files

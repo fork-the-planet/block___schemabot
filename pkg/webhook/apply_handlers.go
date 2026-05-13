@@ -126,6 +126,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
 		Database:    schemaResult.Database,
+		Deployment:  h.service.TernDeployment(repo),
 		Environment: environment,
 		Type:        schemaResult.Type,
 		SchemaFiles: schemaResult.SchemaFiles,
@@ -361,6 +362,7 @@ func (h *Handler) executeApply(
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
 		Database:    schemaResult.Database,
+		Deployment:  h.service.TernDeployment(repo),
 		Environment: environment,
 		Type:        schemaResult.Type,
 		SchemaFiles: schemaResult.SchemaFiles,
@@ -424,10 +426,12 @@ func (h *Handler) executeApply(
 
 	applyReq := api.ApplyRequest{
 		PlanID:         planResp.PlanID,
+		Deployment:     h.service.TernDeployment(repo),
 		Environment:    environment,
 		Options:        options,
 		Caller:         caller,
 		InstallationID: installationID,
+		Target:         schemaResult.Target,
 	}
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)

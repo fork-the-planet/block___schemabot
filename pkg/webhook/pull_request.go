@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
+
+	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // pullRequestPayload represents the relevant fields from a GitHub pull_request webhook.
@@ -175,15 +178,22 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 	}
 }
 
-// cleanupStaleChecks marks checks for databases no longer in the PR as "success".
-// This handles the case where a user removes a schema change from the PR — the old
-// check would otherwise stay at "action_required" and block merge.
+// cleanupStaleChecks updates checks for databases no longer in the PR.
+// Plan-only checks can be marked "success" because the current PR no longer asks
+// SchemaBot to apply anything. Checks that represent a started apply remain
+// blocking because the live database may already have changed or may still change.
 //
 // On synchronize events, headSHA is the new commit SHA. Stale checks must be created
 // as new check runs on this SHA (not updated on the old SHA) so GitHub shows them
 // on the current commit.
 func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, installationID int64, affectedDatabases map[string]bool) {
 	if h.service == nil {
+		metrics.RecordStatusCheckOperation(context.Background(), metrics.StatusCheckOperation{
+			Operation:  "stale_check_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("cannot clean up stale checks without service", "repo", repo, "pr", pr, "head_sha", headSHA)
 		return
 	}
 
@@ -192,6 +202,11 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 
 	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "stale_check_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
 		h.logger.Error("failed to get checks for stale cleanup", "repo", repo, "pr", pr, "error", err)
 		return
 	}
@@ -199,39 +214,126 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 	cleaned := false
 
 	for _, check := range checks {
-		// Skip the aggregate check — it's recomputed, not cleaned up
 		if isAggregateCheck(check) {
+			h.logger.Debug("skipping aggregate check during stale cleanup",
+				"repo", repo, "pr", pr, "head_sha", headSHA,
+				"environment", check.Environment, "check_id", check.ID)
 			continue
 		}
 
 		if affectedDatabases[check.DatabaseName] {
-			continue // still affected, not stale
+			h.logger.Debug("skipping check during stale cleanup because database is still affected",
+				"repo", repo, "pr", pr, "head_sha", headSHA,
+				"database", check.DatabaseName, "database_type", check.DatabaseType,
+				"environment", check.Environment, "check_id", check.ID)
+			continue
 		}
 
-		// This check's database is no longer in the PR — mark as success
+		// This check's database is no longer in the PR.
 		h.logger.Info("cleaning up stale check",
 			"repo", repo, "pr", pr,
-			"database", check.DatabaseName, "environment", check.Environment,
-			"previous_conclusion", check.Conclusion)
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "head_sha", headSHA,
+			"previous_status", check.Status, "previous_conclusion", check.Conclusion,
+			"previous_blocking_reason", check.BlockingReason, "apply_id", check.ApplyID)
 
-		// Update stored check record to success
-		check.HeadSHA = headSHA
-		check.Conclusion = checkConclusionSuccess
-		check.HasChanges = false
-		check.Status = checkStatusCompleted
-		if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
-			h.logger.Error("failed to update stale check record", "checkID", check.ID, "error", err)
+		if checkHasStartedApply(check) {
+			if h.blockStaleStartedApplyCheckState(ctx, repo, pr, headSHA, check) {
+				cleaned = true
+			}
+			continue
 		}
-		cleaned = true
+
+		if h.markStalePlanOnlyCheckStateSuccessful(ctx, repo, pr, headSHA, check) {
+			cleaned = true
+		}
 	}
 
 	// Recompute aggregate on the new HEAD SHA after cleaning up stale checks
 	if cleaned {
 		client, clientErr := h.ghClient.ForInstallation(installationID)
 		if clientErr != nil {
-			h.logger.Error("failed to create GitHub client for aggregate update after stale cleanup", "error", clientErr)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "aggregate_check_sync",
+				Repository: repo,
+				Status:     "error",
+			})
+			h.logger.Error("failed to create GitHub client for aggregate update after stale cleanup",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "error", clientErr)
 			return
 		}
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
+}
+
+func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
+	check.HeadSHA = headSHA
+	check.HasChanges = true
+	check.BlockingReason = schemaRemovedAfterApplyBlock.blockingReason
+	check.ErrorMessage = schemaRemovedAfterApplyBlock.message
+	if check.Status == checkStatusInProgress {
+		check.Conclusion = ""
+	} else {
+		check.Status = checkStatusCompleted
+		check.Conclusion = checkConclusionActionRequired
+	}
+	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "stale_check_cleanup",
+			Repository:   repo,
+			Database:     check.DatabaseName,
+			DatabaseType: check.DatabaseType,
+			Environment:  check.Environment,
+			Status:       "error",
+		})
+		h.logger.Error("failed to block stale check with started apply",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"apply_id", check.ApplyID, "error", err)
+		return false
+	}
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:    "stale_check_cleanup",
+		Repository:   repo,
+		Database:     check.DatabaseName,
+		DatabaseType: check.DatabaseType,
+		Environment:  check.Environment,
+		Status:       "blocked",
+	})
+	return true
+}
+
+func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
+	check.HeadSHA = headSHA
+	check.Conclusion = checkConclusionSuccess
+	check.HasChanges = false
+	check.Status = checkStatusCompleted
+	check.BlockingReason = ""
+	check.ErrorMessage = ""
+	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "stale_check_cleanup",
+			Repository:   repo,
+			Database:     check.DatabaseName,
+			DatabaseType: check.DatabaseType,
+			Environment:  check.Environment,
+			Status:       "error",
+		})
+		h.logger.Error("failed to mark stale plan check successful",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"error", err)
+		return false
+	}
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:    "stale_check_cleanup",
+		Repository:   repo,
+		Database:     check.DatabaseName,
+		DatabaseType: check.DatabaseType,
+		Environment:  check.Environment,
+		Status:       "success",
+	})
+	return true
 }

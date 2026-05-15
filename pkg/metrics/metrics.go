@@ -103,8 +103,8 @@ func RecordApplyDuration(ctx context.Context, duration time.Duration, database, 
 // knownCheckOwnershipOperations limits metric cardinality to expected check
 // ownership miss paths.
 var knownCheckOwnershipOperations = map[string]bool{
-	"complete_apply":           true,
-	"rollback_action_required": true,
+	"apply_finished":    true,
+	"rollback_finished": true,
 }
 
 // RecordCheckOwnershipMiss increments the counter for guarded check updates
@@ -300,6 +300,73 @@ func RecordWebhookEvent(ctx context.Context, eventType, action, repo, status str
 	}
 	if repo != "" {
 		attrs = append(attrs, attribute.String("repository", repo))
+	}
+	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+}
+
+var knownStatusCheckOperations = map[string]bool{
+	"plan_check_recorded":        true,
+	"apply_started":              true,
+	"apply_finished":             true,
+	"rollback_finished":          true,
+	"aggregate_check_sync":       true,
+	"stale_check_cleanup":        true,
+	"stale_check_reconciliation": true,
+	"schema_config_discovery":    true,
+}
+
+var knownStatusCheckStatuses = map[string]bool{
+	"success": true,
+	"error":   true,
+	"skipped": true,
+	"stale":   true,
+	"noop":    true,
+	"blocked": true,
+}
+
+// StatusCheckOperation describes one status-check storage or GitHub operation.
+type StatusCheckOperation struct {
+	Operation    string
+	Repository   string
+	Database     string
+	DatabaseType string
+	Environment  string
+	Status       string
+}
+
+// RecordStatusCheckOperation increments the status-check operations counter.
+// Unknown operation and status values are normalized to prevent unbounded cardinality.
+func RecordStatusCheckOperation(ctx context.Context, op StatusCheckOperation) {
+	if !knownStatusCheckOperations[op.Operation] {
+		op.Operation = "unknown"
+	}
+	if !knownStatusCheckStatuses[op.Status] {
+		op.Status = "unknown"
+	}
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.status_check_operations_total",
+		otelmetric.WithDescription("Total number of status-check operations"),
+		otelmetric.WithUnit("{operation}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create status-check operations counter", "error", err)
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("operation", op.Operation),
+		attribute.String("status", op.Status),
+	}
+	if op.Database != "" {
+		attrs = append(attrs, attribute.String("database", op.Database))
+	}
+	if op.DatabaseType != "" {
+		attrs = append(attrs, attribute.String("database_type", op.DatabaseType))
+	}
+	if op.Environment != "" {
+		attrs = append(attrs, attribute.String("environment", op.Environment))
+	}
+	if op.Repository != "" {
+		attrs = append(attrs, attribute.String("repository", op.Repository))
 	}
 	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
 }

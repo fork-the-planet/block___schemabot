@@ -44,6 +44,28 @@ const aggregateCheckName = "SchemaBot"
 // aggregate (no allowed_environments) uses aggregateSentinel.
 const aggregateSentinel = "_aggregate"
 
+type checkBlockReason struct {
+	blockingReason string
+	message        string
+}
+
+// schemaRemovedAfterApplyBlock is used when the latest PR commit removes a
+// schema change after an apply has already started. blockingReason is the stable
+// machine-readable value stored in checks.blocking_reason; message is shown to
+// users in per-database check state.
+var schemaRemovedAfterApplyBlock = checkBlockReason{
+	blockingReason: "schema_removed_after_apply_started",
+	message:        "Schema changes were removed from the PR after an apply started; operator action is required before this check can pass.",
+}
+
+// rollbackCompletedBlock is used after a rollback succeeds. The target
+// environment no longer has the schema requested by the PR, so the check must
+// stay blocked until the schema change is applied again or the PR is updated.
+var rollbackCompletedBlock = checkBlockReason{
+	blockingReason: "rollback_completed",
+	message:        "Schema changes were rolled back in this environment; apply again before this check can pass.",
+}
+
 // aggregateCheckNameForEnv returns the environment-scoped aggregate check name.
 // e.g., "SchemaBot (staging)" or "SchemaBot (production)".
 func aggregateCheckNameForEnv(env string) string {
@@ -74,10 +96,43 @@ func isAggregateCheck(c *storage.Check) bool {
 		c.DatabaseName == aggregateSentinel
 }
 
+// checkHasStartedApply returns true once work may already have reached, or may
+// still reach, the live database. ApplyID remains set on terminal apply-owned
+// rows so later PR commits cannot clean them up as plan-only state.
+func checkHasStartedApply(c *storage.Check) bool {
+	return c.Status == checkStatusInProgress || c.ApplyID != 0
+}
+
+func checkBlockedByRemovedSchemaAfterApply(c *storage.Check) bool {
+	return c.BlockingReason == schemaRemovedAfterApplyBlock.blockingReason
+}
+
+func checkBlocksPassingAggregate(c *storage.Check) bool {
+	if isAggregateCheck(c) {
+		return false
+	}
+	if checkHasStartedApply(c) {
+		return true
+	}
+	return c.Conclusion == checkConclusionFailure || c.Conclusion == checkConclusionActionRequired
+}
+
+func hasBlockingCheckForEnvironment(checks []*storage.Check, environment string) bool {
+	for _, c := range checks {
+		if environment != aggregateSentinel && c.Environment != environment {
+			continue
+		}
+		if checkBlocksPassingAggregate(c) {
+			return true
+		}
+	}
+	return false
+}
+
 // storePlanCheckRecord stores per-database check state after a plan is generated.
 // The state is used internally by the aggregate check to compute its overall status.
 // No per-database GitHub Check Run is created — only the aggregate is visible on the PR.
-// Returns the PR head SHA. Failures are non-fatal.
+// Returns the latest commit SHA on the PR branch. Failures are non-fatal.
 func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
@@ -218,7 +273,7 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
-		return fmt.Errorf("fetch PR head SHA for stale reconciliation aggregate repo %s pr %d: %w", repo, pr, err)
+		return fmt.Errorf("fetch latest PR commit SHA for stale reconciliation aggregate repo %s pr %d: %w", repo, pr, err)
 	}
 	if prInfo.HeadSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, prInfo.HeadSHA)
@@ -241,10 +296,12 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 	}
 
 	var conclusion string
-	switch apply.State {
-	case state.Apply.Completed:
+	switch {
+	case state.IsState(apply.State, state.Apply.Completed) && checkBlockedByRemovedSchemaAfterApply(check):
+		conclusion = checkConclusionActionRequired
+	case state.IsState(apply.State, state.Apply.Completed):
 		conclusion = checkConclusionSuccess
-	case state.Apply.Failed:
+	case state.IsState(apply.State, state.Apply.Failed):
 		conclusion = checkConclusionFailure
 	default:
 		conclusion = checkConclusionFailure
@@ -259,7 +316,7 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
 	}
 	if !updated {
-		metrics.RecordCheckOwnershipMiss(ctx, "complete_apply", repo, apply.Database, apply.DatabaseType, apply.Environment)
+		metrics.RecordCheckOwnershipMiss(ctx, "apply_finished", repo, apply.Database, apply.DatabaseType, apply.Environment)
 		h.logger.Warn("skipping check state update because stored state no longer belongs to apply",
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
@@ -273,7 +330,8 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		"repo", repo, "pr", pr, "database", apply.Database,
 		"database_type", apply.DatabaseType, "environment", apply.Environment,
 		"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
-		"apply_state", apply.State, "conclusion", conclusion)
+		"apply_state", apply.State, "conclusion", conclusion,
+		"blocking_reason", check.BlockingReason)
 	return true, nil
 }
 
@@ -303,6 +361,8 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 	check.Status = checkStatusCompleted
 	check.Conclusion = checkConclusionActionRequired
 	check.HasChanges = true
+	check.BlockingReason = rollbackCompletedBlock.blockingReason
+	check.ErrorMessage = rollbackCompletedBlock.message
 	updated, err := h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
 	if err != nil {
 		h.logger.Error("failed to set check to action_required after rollback",
@@ -314,7 +374,7 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 		return
 	}
 	if !updated {
-		metrics.RecordCheckOwnershipMiss(ctx, "rollback_action_required", repo, apply.Database, apply.DatabaseType, apply.Environment)
+		metrics.RecordCheckOwnershipMiss(ctx, "rollback_finished", repo, apply.Database, apply.DatabaseType, apply.Environment)
 		h.logger.Warn("skipping rollback action_required update because check no longer belongs to apply",
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
@@ -599,6 +659,12 @@ func (h *Handler) upsertAggregateCheckRun(
 	// Look up existing aggregate check state using the environment-specific key.
 	existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, aggregateSentinel, aggregateSentinel)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   "aggregate_check_sync",
+			Repository:  repo,
+			Environment: environment,
+			Status:      "error",
+		})
 		h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "environment", environment, "error", err)
 		return
 	}
@@ -609,7 +675,17 @@ func (h *Handler) upsertAggregateCheckRun(
 	var checkRunID int64
 	if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
 		if err := client.UpdateCheckRun(ctx, repo, existing.CheckRunID, opts); err != nil {
-			h.logger.Error("failed to update aggregate check run", "checkRunID", existing.CheckRunID, "error", err)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_check_sync",
+				Repository:  repo,
+				Environment: environment,
+				Status:      "error",
+			})
+			h.logger.Error("failed to update aggregate check run",
+				"repo", repo, "pr", pr, "check_name", checkName,
+				"environment", environment, "check_run_id", existing.CheckRunID,
+				"head_sha", headSHA, "status", status,
+				"conclusion", conclusion, "error", err)
 			return
 		}
 		checkRunID = existing.CheckRunID
@@ -621,7 +697,16 @@ func (h *Handler) upsertAggregateCheckRun(
 		}
 		id, err := client.CreateCheckRun(ctx, repo, headSHA, opts)
 		if err != nil {
-			h.logger.Error("failed to create aggregate check run", "error", err)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_check_sync",
+				Repository:  repo,
+				Environment: environment,
+				Status:      "error",
+			})
+			h.logger.Error("failed to create aggregate check run",
+				"repo", repo, "pr", pr, "check_name", checkName,
+				"environment", environment, "head_sha", headSHA,
+				"status", status, "conclusion", conclusion, "error", err)
 			return
 		}
 		checkRunID = id
@@ -640,11 +725,29 @@ func (h *Handler) upsertAggregateCheckRun(
 		Conclusion:   conclusion,
 	}
 	if err := h.service.Storage().Checks().Upsert(ctx, aggCheck); err != nil {
-		h.logger.Error("failed to store aggregate check state", "error", err)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   "aggregate_check_sync",
+			Repository:  repo,
+			Environment: environment,
+			Status:      "error",
+		})
+		h.logger.Error("failed to store aggregate check state",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "check_run_id", checkRunID,
+			"head_sha", headSHA, "status", status,
+			"conclusion", conclusion, "error", err)
+		return
 	}
 
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:   "aggregate_check_sync",
+		Repository:  repo,
+		Environment: environment,
+		Status:      "success",
+	})
 	h.logger.Info("aggregate check updated",
 		"repo", repo, "pr", pr, "check_name", checkName,
+		"environment", environment, "check_run_id", checkRunID,
 		"status", status, "conclusion", conclusion,
 		"per_database_checks", len(dbChecks))
 }
@@ -653,9 +756,20 @@ func (h *Handler) upsertAggregateCheckRun(
 // Called when this instance has no work to do for a PR — either because the PR doesn't
 // touch schema files, or because the databases don't have environments this instance
 // manages. Without this, branch protection would block indefinitely waiting for a
-// check that would never come.
+// check that would never come. It does not publish success over existing
+// per-database state that still needs operator attention.
 func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, title, summary string) {
 	config := h.service.Config()
+	storedChecks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "aggregate_check_sync",
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("failed to fetch checks before passing aggregate", "repo", repo, "pr", pr, "error", err)
+		return
+	}
 
 	type envCheck struct {
 		name        string
@@ -682,6 +796,18 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 	for _, ec := range checks {
 		checkName := ec.name
 
+		if hasBlockingCheckForEnvironment(storedChecks, ec.environment) {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_check_sync",
+				Repository:  repo,
+				Environment: ec.environment,
+				Status:      "blocked",
+			})
+			h.logger.Info("skipping passing aggregate because stored checks still block",
+				"repo", repo, "pr", pr, "check_name", checkName, "environment", ec.environment)
+			continue
+		}
+
 		opts := ghclient.CheckRunOptions{
 			Name:       checkName,
 			Status:     checkStatusCompleted,
@@ -694,12 +820,24 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 
 		existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, ec.environment, aggregateSentinel, aggregateSentinel)
 		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_check_sync",
+				Repository:  repo,
+				Environment: ec.environment,
+				Status:      "error",
+			})
 			h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "env", ec.environment, "error", err)
 			continue
 		}
 
 		// Skip if already passing for this SHA
 		if existing != nil && existing.HeadSHA == headSHA && existing.Conclusion == checkConclusionSuccess {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_check_sync",
+				Repository:  repo,
+				Environment: ec.environment,
+				Status:      "noop",
+			})
 			h.logger.Debug("passing aggregate already exists", "repo", repo, "pr", pr, "check_name", checkName)
 			continue
 		}
@@ -707,14 +845,31 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 		var checkRunID int64
 		if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
 			if err := client.UpdateCheckRun(ctx, repo, existing.CheckRunID, opts); err != nil {
-				h.logger.Error("failed to update passing aggregate", "error", err)
+				metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+					Operation:   "aggregate_check_sync",
+					Repository:  repo,
+					Environment: ec.environment,
+					Status:      "error",
+				})
+				h.logger.Error("failed to update passing aggregate",
+					"repo", repo, "pr", pr, "check_name", checkName,
+					"environment", ec.environment, "check_run_id", existing.CheckRunID,
+					"head_sha", headSHA, "error", err)
 				continue
 			}
 			checkRunID = existing.CheckRunID
 		} else {
 			id, err := client.CreateCheckRun(ctx, repo, headSHA, opts)
 			if err != nil {
-				h.logger.Error("failed to create passing aggregate", "error", err)
+				metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+					Operation:   "aggregate_check_sync",
+					Repository:  repo,
+					Environment: ec.environment,
+					Status:      "error",
+				})
+				h.logger.Error("failed to create passing aggregate",
+					"repo", repo, "pr", pr, "check_name", checkName,
+					"environment", ec.environment, "head_sha", headSHA, "error", err)
 				continue
 			}
 			checkRunID = id
@@ -733,13 +888,29 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 			Conclusion:   checkConclusionSuccess,
 		}
 		if err := h.service.Storage().Checks().Upsert(ctx, aggCheck); err != nil {
-			h.logger.Error("failed to store passing aggregate check", "error", err)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_check_sync",
+				Repository:  repo,
+				Environment: ec.environment,
+				Status:      "error",
+			})
+			h.logger.Error("failed to store passing aggregate check",
+				"repo", repo, "pr", pr, "check_name", checkName,
+				"environment", ec.environment, "check_run_id", checkRunID,
+				"head_sha", headSHA, "error", err)
+			continue
 		}
 
 		action := "created"
 		if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
 			action = "updated"
 		}
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   "aggregate_check_sync",
+			Repository:  repo,
+			Environment: ec.environment,
+			Status:      "success",
+		})
 		h.logger.Info("posted passing aggregate",
 			"repo", repo, "pr", pr, "check_name", checkName, "env", ec.environment, "action", action)
 	}

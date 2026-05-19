@@ -87,6 +87,8 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 	// Discover all configs matching changed schema files in this PR
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// Dedupe FetchPullRequest calls within this webhook delivery.
+	ctx = ghclient.WithPRInfoCache(ctx)
 
 	client, err := h.ghClient.ForInstallation(installationID)
 	if err != nil {

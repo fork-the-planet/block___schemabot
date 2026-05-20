@@ -55,6 +55,18 @@ type Client struct {
 	// every call.
 	installationsMu sync.Mutex
 	installations   map[int64]*InstallationClient
+
+	// checkStatusSingleflight coalesces concurrent GetPRCheckStatuses
+	// calls for the same (repo, sha) into a single upstream request via
+	// singleflight. Shared across every InstallationClient this factory
+	// produces so concurrent webhook deliveries and command bursts
+	// targeting the same commit collapse to a single GraphQL round
+	// trip even though each delivery may spawn a fresh InstallationClient.
+	// Deliberately not a TTL cache: check status is mutable for a SHA
+	// (reruns, late-arriving checks, branch-protection adding required
+	// checks), so any memoisation window would risk converting a
+	// now-failing gate into a passing one.
+	checkStatusSingleflight *CheckStatusSingleflight
 }
 
 // loadAppSlug returns the current app slug, or empty if not yet fetched.
@@ -74,20 +86,26 @@ func (c *Client) storeAppSlug(slug string) {
 // app slug couldn't be fetched at startup (e.g., GitHub was temporarily down).
 const slugFetchRetryCooldown = 5 * time.Second
 
-// NewClient creates a new GitHub App client and fetches the app's slug from GitHub.
-// If the slug can't be fetched (e.g., GitHub is down), the server still starts but
-// PR applies are blocked by the check gate since we can't identify our own checks.
+// NewClient creates a new GitHub App client.
+//
+// Fetches the app's slug from GitHub. If the slug can't be fetched (e.g., GitHub
+// is down), the server still starts but PR applies are blocked by the check gate
+// since we can't identify our own checks.
 //
 // The returned Client memoises the *InstallationClient it produces by
 // installationID so the underlying http.Client, gh.Client, githubv4.Client, and
 // ghinstallation transport (and its installation-token cache) are reused across
-// webhook deliveries.
+// webhook deliveries. It also owns a CheckStatusSingleflight that is shared
+// across every InstallationClient it produces, so concurrent webhook
+// deliveries and command bursts targeting the same (repo, sha) collapse to a
+// single upstream GraphQL request.
 func NewClient(appID int64, privateKey []byte, logger *slog.Logger) *Client {
 	c := &Client{
-		appID:         appID,
-		privateKey:    privateKey,
-		logger:        logger,
-		installations: make(map[int64]*InstallationClient),
+		appID:                   appID,
+		privateKey:              privateKey,
+		logger:                  logger,
+		installations:           make(map[int64]*InstallationClient),
+		checkStatusSingleflight: NewCheckStatusSingleflight(),
 	}
 	// Seed the atomic with the empty string so loadAppSlug never returns
 	// from a nil pointer.
@@ -173,9 +191,10 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 	httpc := &http.Client{Transport: transport, Timeout: 30 * time.Second}
 	ghClient := gh.NewClient(httpc)
 	ic := &InstallationClient{
-		client: ghClient,
-		gql:    githubv4.NewEnterpriseClient(graphQLURLFor(ghClient), httpc),
-		logger: c.logger,
+		client:                  ghClient,
+		gql:                     githubv4.NewEnterpriseClient(graphQLURLFor(ghClient), httpc),
+		logger:                  c.logger,
+		checkStatusSingleflight: c.checkStatusSingleflight,
 	}
 	ic.storeAppSlug(slug)
 	c.installations[installationID] = ic
@@ -222,6 +241,17 @@ type InstallationClient struct {
 	// this field after a slug recovery while concurrent isOwnAppSlug reads
 	// run on other goroutines.
 	appSlug atomic.Pointer[string]
+
+	// checkStatusSingleflight is owned by the parent Client factory and
+	// shared across every InstallationClient it produces so concurrent
+	// fetches collapse across the short-lived InstallationClients
+	// spawned per webhook delivery. It delivers identity-independent
+	// rows; IsSchemaBot is re-derived per call against this client's
+	// appSlug snapshot, so a shared fetch delivered to N waiters with
+	// different appSlug snapshots is classified correctly for each.
+	// Optional: when nil, GetPRCheckStatuses bypasses the coalescer
+	// (e.g. tests).
+	checkStatusSingleflight *CheckStatusSingleflight
 }
 
 // loadAppSlug returns the current app slug, or empty if not yet set.
@@ -637,9 +667,10 @@ type statusCheckRollupQuery struct {
 	} `graphql:"repository(owner: $owner, name: $repo)"`
 }
 
-// isOwnAppSlug returns true if the given slug belongs to this SchemaBot instance.
-// Returns false on empty slug (defends against StatusContext rows and clients
-// whose appSlug has not yet been fetched).
+// isOwnAppSlug returns true if the given slug belongs to this SchemaBot
+// instance. An empty slug never matches — both to handle StatusContext rows
+// (which have no App) and to fail closed when ic.appSlug has not yet been
+// fetched, so cached rows are never misclassified as SchemaBot's own.
 func (ic *InstallationClient) isOwnAppSlug(slug string) bool {
 	if slug == "" {
 		return false
@@ -655,7 +686,51 @@ func (ic *InstallationClient) isOwnAppSlug(slug string) bool {
 // the GraphQL Commit.statusCheckRollup, which returns already-deduped, latest-only
 // results in a single round trip. SchemaBot's own check runs are identified via
 // the GitHub App slug (more reliable than name matching).
+//
+// Concurrent calls for the same (repo, ref) collapse to a single upstream
+// GraphQL request via the Client-shared singleflight (when configured), so
+// a webhook delivery or command burst that fans out to multiple gate
+// checks for the same commit makes one round trip — even across the
+// short-lived InstallationClients spawned per delivery. The singleflight
+// delivers identity-independent rows; IsSchemaBot is re-derived per call
+// against this client's appSlug snapshot so a shared fetch delivered to N
+// waiters with different appSlug snapshots is classified correctly for
+// each.
 func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo string, ref string) ([]PRCheckStatus, error) {
+	var (
+		rows []CheckStatusRow
+		err  error
+	)
+	if ic.checkStatusSingleflight == nil {
+		rows, err = ic.fetchPRCheckStatuses(ctx, repo, ref)
+	} else {
+		// The singleflight supplies its own ctx to the fetch so a
+		// caller cancelling cannot abort the shared GitHub request and
+		// fail unrelated waiters.
+		rows, err = ic.checkStatusSingleflight.Do(ctx, repo, ref, func(fetchCtx context.Context) ([]CheckStatusRow, error) {
+			return ic.fetchPRCheckStatuses(fetchCtx, repo, ref)
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]PRCheckStatus, len(rows))
+	for i, r := range rows {
+		out[i] = PRCheckStatus{
+			Name:        r.Name,
+			Status:      r.Status,
+			Conclusion:  r.Conclusion,
+			IsSchemaBot: ic.isOwnAppSlug(r.AppSlug),
+		}
+	}
+	return out, nil
+}
+
+// fetchPRCheckStatuses performs the actual GraphQL round trip for
+// GetPRCheckStatuses, returning identity-independent rows suitable for
+// caching across InstallationClients with different appSlug snapshots.
+func (ic *InstallationClient) fetchPRCheckStatuses(ctx context.Context, repo string, ref string) ([]CheckStatusRow, error) {
 	owner, repoName := splitRepo(repo)
 
 	vars := map[string]any{
@@ -665,7 +740,7 @@ func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo strin
 		"after": (*githubv4.String)(nil),
 	}
 
-	var out []PRCheckStatus
+	var out []CheckStatusRow
 	for {
 		var q statusCheckRollupQuery
 		if err := ic.gql.Query(ctx, &q, vars); err != nil {
@@ -675,19 +750,20 @@ func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo strin
 		for _, n := range contexts.Nodes {
 			switch n.Typename {
 			case "CheckRun":
-				out = append(out, PRCheckStatus{
-					Name:        n.CheckRun.Name,
-					Status:      strings.ToLower(n.CheckRun.Status),
-					Conclusion:  strings.ToLower(n.CheckRun.Conclusion),
-					IsSchemaBot: ic.isOwnAppSlug(n.CheckRun.CheckSuite.App.Slug),
+				out = append(out, CheckStatusRow{
+					Name:       n.CheckRun.Name,
+					Status:     strings.ToLower(n.CheckRun.Status),
+					Conclusion: strings.ToLower(n.CheckRun.Conclusion),
+					AppSlug:    n.CheckRun.CheckSuite.App.Slug,
 				})
 			case "StatusContext":
 				status, conclusion := mapLegacyStatusState(n.StatusContext.State)
-				out = append(out, PRCheckStatus{
-					Name:        n.StatusContext.Context,
-					Status:      status,
-					Conclusion:  conclusion,
-					IsSchemaBot: false, // commit statuses don't have app slugs — never SchemaBot's own
+				out = append(out, CheckStatusRow{
+					Name:       n.StatusContext.Context,
+					Status:     status,
+					Conclusion: conclusion,
+					// AppSlug left empty: commit statuses have no App, so
+					// IsSchemaBot evaluates to false regardless of ic.appSlug.
 				})
 			}
 		}

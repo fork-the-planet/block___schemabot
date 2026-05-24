@@ -246,6 +246,58 @@ func TestServerConfig_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "valid required checks",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				RequiredChecks: []string{"Required Review", "CI / lint"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "required checks reject empty values",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				RequiredChecks: []string{"Required Review", ""},
+			},
+			wantErr: true,
+		},
+		{
+			name: "required checks reject duplicate values",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				RequiredChecks: []string{"Required Review", "Required Review"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "required checks reject leading and trailing whitespace",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				RequiredChecks: []string{"Required Review "},
+			},
+			wantErr: true,
+		},
+		{
 			name: "remote database target",
 			cfg: ServerConfig{
 				Databases: map[string]DatabaseConfig{
@@ -1073,6 +1125,51 @@ require_passing_checks: false
 		require.NoError(t, err)
 
 		assert.False(t, cfg.ShouldRequirePassingChecks())
+	})
+}
+
+func TestServerConfig_IsCheckRequired(t *testing.T) {
+	t.Run("nil receiver requires all checks", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.True(t, cfg.IsCheckRequired("CI / lint"))
+	})
+
+	t.Run("empty list requires all checks", func(t *testing.T) {
+		cfg := &ServerConfig{}
+		assert.True(t, cfg.IsCheckRequired("CI / lint"))
+	})
+
+	t.Run("configured list matches exact names only", func(t *testing.T) {
+		cfg := &ServerConfig{RequiredChecks: []string{"Required Review", "CI / lint"}}
+		assert.True(t, cfg.IsCheckRequired("Required Review"))
+		assert.True(t, cfg.IsCheckRequired("CI / lint"))
+		assert.False(t, cfg.IsCheckRequired("required review"))
+		assert.False(t, cfg.IsCheckRequired("CI / tests"))
+	})
+
+	t.Run("YAML deserialization", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "config.yaml")
+		content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/testapp"
+required_checks:
+  - "Required Review"
+  - "CI / lint"
+`
+		err := os.WriteFile(configPath, []byte(content), 0644)
+		require.NoError(t, err)
+
+		cfg, err := LoadServerConfigFromFile(configPath)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"Required Review", "CI / lint"}, cfg.RequiredChecks)
+		assert.True(t, cfg.IsCheckRequired("Required Review"))
+		assert.False(t, cfg.IsCheckRequired("CI / tests"))
 	})
 }
 

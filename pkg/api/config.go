@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
@@ -67,6 +68,11 @@ type ServerConfig struct {
 	//
 	// Defaults to true when not configured (nil = enabled).
 	RequirePassingChecks *bool `yaml:"require_passing_checks"`
+
+	// RequiredChecks narrows the PR checks gate to named checks when any of
+	// those checks are present in the GitHub status rollup. When empty, all
+	// non-SchemaBot checks are evaluated.
+	RequiredChecks []string `yaml:"required_checks"`
 
 	// RespondToUnscoped controls whether this instance responds to commands
 	// that are not scoped to a specific environment. In multi-instance
@@ -308,6 +314,9 @@ func (c *ServerConfig) Validate() error {
 	if err := validateUniqueNames("environment_order", c.EnvironmentOrder); err != nil {
 		return err
 	}
+	if err := validateUniqueNames("required_checks", c.RequiredChecks); err != nil {
+		return err
+	}
 	if err := validatePRCommandAuthorization(c.PRCommandAuthorization); err != nil {
 		return err
 	}
@@ -401,6 +410,9 @@ func validateUniqueNames(field string, names []string) error {
 	for _, name := range names {
 		if name == "" {
 			return fmt.Errorf("%s contains an empty value", field)
+		}
+		if strings.TrimSpace(name) != name {
+			return fmt.Errorf("%s contains value %q with leading or trailing whitespace", field, name)
 		}
 		if _, ok := seen[name]; ok {
 			return fmt.Errorf("%s contains duplicate value %q", field, name)
@@ -547,6 +559,16 @@ func (c *ServerConfig) ShouldRequirePassingChecks() bool {
 		return true
 	}
 	return *c.RequirePassingChecks
+}
+
+// IsCheckRequired returns whether a PR check name is part of the configured
+// checks gate. When no names are configured, every non-SchemaBot check remains
+// in scope.
+func (c *ServerConfig) IsCheckRequired(name string) bool {
+	if c == nil || len(c.RequiredChecks) == 0 {
+		return true
+	}
+	return slices.Contains(c.RequiredChecks, name)
 }
 
 // StorageDSN returns the resolved storage DSN.

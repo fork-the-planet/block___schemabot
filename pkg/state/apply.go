@@ -174,21 +174,20 @@ func IsState(s string, expected ...string) bool {
 // IsTerminalApplyState returns true if the state is a terminal state
 // where no further processing will occur. FailedRetryable is not terminal;
 // scheduler workers may claim and retry it.
+// Accepts any format (proto "STATE_COMPLETED", uppercase "COMPLETED", or
+// canonical lowercase "completed") — normalizes first.
 func IsTerminalApplyState(s string) bool {
-	switch s {
-	case Apply.Completed, Apply.Failed, Apply.Stopped, Apply.Cancelled, Apply.Reverted:
-		return true
-	default:
-		return false
-	}
+	info, ok := LookupApply(NormalizeState(s))
+	return ok && info.Terminal
 }
 
-// IsBranchSetupPhase returns true if the apply state is a PlanetScale branch
-// lifecycle phase where per-table progress is not yet meaningful (all tables
-// are Queued). Used by the TUI and CLI to hide the table list during setup.
+// IsSetupPhase returns true if the apply state is an engine-lifecycle phase
+// that runs before per-table progress is meaningful (all tables are Queued).
+// Used by the TUI and CLI to hide the table list during setup.
 // WaitingForDeploy is included because the deploy hasn't started yet.
-func IsBranchSetupPhase(s string) bool {
-	return IsState(s, Apply.Pending, Apply.PreparingBranch, Apply.ApplyingBranchChanges, Apply.ValidatingBranch, Apply.CreatingDeployRequest, Apply.ValidatingDeployRequest, Apply.WaitingForDeploy)
+func IsSetupPhase(s string) bool {
+	info, ok := LookupApply(NormalizeState(s))
+	return ok && info.SetupPhase
 }
 
 // IsPlanetScaleEngine returns true if the engine string indicates PlanetScale/Vitess.

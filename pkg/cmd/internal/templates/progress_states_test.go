@@ -1,12 +1,15 @@
 package templates
 
 import (
+	"io"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLabel_PlanetScalePhases(t *testing.T) {
@@ -27,6 +30,139 @@ func TestFormatProgressState_PlanetScalePhases(t *testing.T) {
 	assert.Contains(t, FormatProgressState(state.Apply.ValidatingDeployRequest), "Validating deploy request")
 	assert.Contains(t, FormatProgressState(state.Apply.Cancelled), "Cancelled")
 	assert.Contains(t, FormatProgressState(state.Apply.FailedRetryable), "Retrying")
+}
+
+func TestWriteStatusListHasMoreFooter(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 0,
+			Limit:       20,
+			MaxLimit:    1000,
+			HasMore:     true,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-example",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "Recent schema changes")
+	assert.Contains(t, output, "apply-example")
+	assert.Contains(t, output, "Showing the 20 most recent schema changes. Use --limit N to show more.")
+	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details")
+}
+
+func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 0,
+			Limit:       1000,
+			MaxLimit:    1000,
+			HasMore:     true,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-example",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "Showing the 1000 most recent schema changes. This server caps status history at 1000.")
+	assert.NotContains(t, output, "Use --limit N to show more.")
+}
+
+func TestWriteStatusListExternalID(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount:    0,
+			Limit:          20,
+			MaxLimit:       1000,
+			HasMore:        false,
+			ShowExternalID: true,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-complete",
+					ExternalID:  "external-123",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "EXTERNAL ID")
+	assert.Contains(t, output, "external-123")
+	assert.Contains(t, output, "apply-complete")
+}
+
+func TestWriteStatusListFailedOnly(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			Limit:          20,
+			MaxLimit:       1000,
+			FailuresOnly:   true,
+			ShowExternalID: true,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:      "apply-failed",
+					ExternalID:   "external-failed",
+					Database:     "payments",
+					Environment:  "staging",
+					State:        state.Apply.Failed,
+					StartedAt:    "2026-05-28T11:00:00Z",
+					CompletedAt:  "2026-05-28T11:00:03Z",
+					Caller:       "github:alice",
+					ErrorMessage: "failed to apply schema change\nbecause duplicate column name 'status'",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "Recent failed schema changes")
+	assert.Contains(t, output, "payments staging: Failed (github:alice; external_id=external-failed) [2026-05-28 11:00:03 UTC]")
+	assert.Contains(t, output, "failed to apply schema change because duplicate column name 'status'")
+	assert.Contains(t, output, "schemabot status apply-failed")
+	assert.NotContains(t, output, "APPLY ID")
+	assert.NotContains(t, output, "REASON")
+	assert.NotContains(t, output, "Use 'schemabot status <apply_id>' to view details")
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	original := os.Stdout
+	read, write, err := os.Pipe()
+	require.NoError(t, err)
+	defer func() {
+		os.Stdout = original
+	}()
+
+	os.Stdout = write
+	fn()
+	require.NoError(t, write.Close())
+
+	output, err := io.ReadAll(read)
+	require.NoError(t, err)
+	require.NoError(t, read.Close())
+
+	return string(output)
 }
 
 func TestProgressSymbol(t *testing.T) {

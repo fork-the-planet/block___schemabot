@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
@@ -12,7 +13,10 @@ import (
 type StatusCmd struct {
 	ApplyIDArg  string `arg:"" optional:"" help:"Apply ID to show details for" name:"apply_id"`
 	Database    string `short:"d" help:"Database name (show apply history)"`
-	Environment string `short:"e" help:"Environment filter (with -d)"`
+	Environment string `short:"e" help:"Environment filter"`
+	Limit       int    `short:"n" help:"Maximum recent applies to show (default 20, max 1000)"`
+	Failed      bool   `help:"Show only failed recent applies" name:"failed"`
+	ExternalID  bool   `help:"Show external engine apply IDs" name:"external-id"`
 	JSON        bool   `help:"Output as JSON"`
 }
 
@@ -33,8 +37,12 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		return showDatabaseHistory(ep, cmd.Database, cmd.Environment, cmd.JSON)
 	}
 
-	// Mode 3: List all active applies
-	result, err := client.GetStatus(ep)
+	// Mode 3: List recent applies
+	result, err := client.GetStatus(ep, client.StatusOptions{
+		Limit:       cmd.Limit,
+		Environment: cmd.Environment,
+		Failed:      cmd.Failed,
+	})
 	if err != nil {
 		return err
 	}
@@ -46,26 +54,37 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 	// Convert to template format
 	applies := make([]templates.ActiveApplyData, 0, len(result.Applies))
 	for _, a := range result.Applies {
-		applies = append(applies, templates.ActiveApplyData{
-			ApplyID:     a.ApplyID,
-			Database:    a.Database,
-			Environment: a.Environment,
-			State:       a.State,
-			Engine:      a.Engine,
-			Caller:      a.Caller,
-			StartedAt:   a.StartedAt,
-			CompletedAt: a.CompletedAt,
-			UpdatedAt:   a.UpdatedAt,
-			Volume:      a.Volume,
-		})
+		applies = append(applies, activeApplyDataFromResponse(a))
 	}
 
 	templates.WriteStatusList(templates.StatusListData{
-		ActiveCount: result.ActiveCount,
-		Applies:     applies,
+		ActiveCount:    result.ActiveCount,
+		Limit:          result.Limit,
+		MaxLimit:       result.MaxLimit,
+		HasMore:        result.HasMore,
+		FailuresOnly:   result.FailuresOnly,
+		ShowExternalID: cmd.ExternalID,
+		Applies:        applies,
 	})
 
 	return nil
+}
+
+func activeApplyDataFromResponse(a *apitypes.ActiveApplyResponse) templates.ActiveApplyData {
+	return templates.ActiveApplyData{
+		ApplyID:      a.ApplyID,
+		ExternalID:   a.ExternalID,
+		Database:     a.Database,
+		Environment:  a.Environment,
+		State:        a.State,
+		Engine:       a.Engine,
+		Caller:       a.Caller,
+		ErrorMessage: a.ErrorMessage,
+		StartedAt:    a.StartedAt,
+		CompletedAt:  a.CompletedAt,
+		UpdatedAt:    a.UpdatedAt,
+		Volume:       a.Volume,
+	}
 }
 
 // showApplyByID shows details for a specific apply by its ID.

@@ -129,6 +129,34 @@ func (s *staticApplyStore) Update(_ context.Context, apply *storage.Apply) error
 	return s.err
 }
 
+type recentApplyStore struct {
+	storage.ApplyStore
+	filters []storage.RecentAppliesFilter
+	applies []*storage.Apply
+	err     error
+}
+
+func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
+	s.filters = append(s.filters, filter)
+	if s.err != nil {
+		return nil, s.err
+	}
+	applies := make([]*storage.Apply, 0, len(s.applies))
+	for _, apply := range s.applies {
+		if filter.Environment != "" && apply.Environment != filter.Environment {
+			continue
+		}
+		if len(filter.States) > 0 && !state.IsState(apply.State, filter.States...) {
+			continue
+		}
+		applies = append(applies, apply)
+	}
+	if filter.Limit > 0 && len(applies) > filter.Limit {
+		return applies[:filter.Limit], nil
+	}
+	return applies, nil
+}
+
 type capturingApplyStore struct {
 	storage.ApplyStore
 	mu        sync.Mutex
@@ -1046,6 +1074,188 @@ func TestProgressResponseFromProtoPreservesVSchemaChangeType(t *testing.T) {
 
 	require.Len(t, resp.Tables, 1)
 	assert.Equal(t, "vschema_update", resp.Tables[0].ChangeType)
+}
+
+func TestHandleStatusLimitAndEnvironment(t *testing.T) {
+	now := time.Now().UTC()
+	applies := &recentApplyStore{
+		applies: []*storage.Apply{
+			{
+				ApplyIdentifier: "apply-one",
+				ExternalID:      "external-one",
+				Database:        "orders",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Completed,
+				Caller:          "cli",
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			},
+			{
+				ApplyIdentifier: "apply-two",
+				Database:        "payments",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Running,
+				Caller:          "cli",
+				CreatedAt:       now.Add(-time.Minute),
+				UpdatedAt:       now.Add(-time.Minute),
+			},
+			{
+				ApplyIdentifier: "apply-failed",
+				Database:        "orders",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Failed,
+				Caller:          "github:alice",
+				ErrorMessage:    "duplicate column name 'status'",
+				CreatedAt:       now.Add(-90 * time.Second),
+				UpdatedAt:       now.Add(-90 * time.Second),
+			},
+			{
+				ApplyIdentifier: "apply-three",
+				Database:        "inventory",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Completed,
+				Caller:          "cli",
+				CreatedAt:       now.Add(-2 * time.Minute),
+				UpdatedAt:       now.Add(-2 * time.Minute),
+			},
+		},
+	}
+	stor := &mockStorageWithApplyStores{applies: applies}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?limit=2&environment=staging", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	require.Len(t, applies.filters, 1)
+	assert.Equal(t, 3, applies.filters[0].Limit, "server should request one extra row to detect truncation")
+	assert.Equal(t, "staging", applies.filters[0].Environment)
+	assert.Empty(t, applies.filters[0].States)
+	assert.Equal(t, 2, resp.Limit)
+	assert.Equal(t, maxStatusLimit, resp.MaxLimit)
+	assert.True(t, resp.HasMore)
+	assert.False(t, resp.FailuresOnly)
+	assert.Equal(t, 1, resp.ActiveCount)
+	require.Len(t, resp.Applies, 2)
+	assert.Equal(t, "apply-one", resp.Applies[0].ApplyID)
+	assert.Equal(t, "external-one", resp.Applies[0].ExternalID)
+	assert.Equal(t, "apply-two", resp.Applies[1].ApplyID)
+}
+
+func TestHandleStatusFailedFilter(t *testing.T) {
+	now := time.Now().UTC()
+	applies := &recentApplyStore{
+		applies: []*storage.Apply{
+			{
+				ApplyIdentifier: "apply-completed",
+				Database:        "orders",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Completed,
+				Caller:          "cli",
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			},
+			{
+				ApplyIdentifier: "apply-failed",
+				ExternalID:      "external-failed",
+				Database:        "payments",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Failed,
+				Caller:          "github:alice",
+				ErrorMessage:    "duplicate column name 'status'",
+				CreatedAt:       now.Add(-time.Minute),
+				UpdatedAt:       now.Add(-time.Minute),
+			},
+		},
+	}
+	stor := &mockStorageWithApplyStores{applies: applies}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?limit=2&environment=staging&failed=true", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	require.Len(t, applies.filters, 1)
+	assert.Equal(t, 3, applies.filters[0].Limit)
+	assert.Equal(t, "staging", applies.filters[0].Environment)
+	assert.Equal(t, []string{state.Apply.Failed, state.Apply.FailedRetryable}, applies.filters[0].States)
+	assert.True(t, resp.FailuresOnly)
+	assert.Equal(t, 0, resp.ActiveCount)
+	require.Len(t, resp.Applies, 1)
+	assert.Equal(t, "apply-failed", resp.Applies[0].ApplyID)
+	assert.Equal(t, "external-failed", resp.Applies[0].ExternalID)
+	assert.Equal(t, "duplicate column name 'status'", resp.Applies[0].ErrorMessage)
+}
+
+func TestParseStatusLimit(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		target    string
+		want      int
+		wantError bool
+	}{
+		{name: "default", target: "/api/status", want: defaultStatusLimit},
+		{name: "custom", target: "/api/status?limit=50", want: 50},
+		{name: "clamped", target: "/api/status?limit=5000", want: maxStatusLimit},
+		{name: "zero", target: "/api/status?limit=0", wantError: true},
+		{name: "not a number", target: "/api/status?limit=lots", wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.target, nil)
+			got, err := parseStatusLimit(req)
+			if tt.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestParseStatusFailuresOnly(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		target    string
+		want      bool
+		wantError bool
+	}{
+		{name: "default", target: "/api/status"},
+		{name: "true", target: "/api/status?failed=true", want: true},
+		{name: "false", target: "/api/status?failed=false"},
+		{name: "invalid", target: "/api/status?failed=maybe", wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.target, nil)
+			got, err := parseStatusFailuresOnly(req)
+			if tt.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestHealth(t *testing.T) {

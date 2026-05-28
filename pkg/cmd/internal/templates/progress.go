@@ -13,6 +13,8 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
+const maxStatusFailureReasonWidth = 240
+
 // Indentation for progress rendering.
 // indentTable is the prefix for table names. Aligns with keyspace name after "── " in headers.
 const indentTable = "     " // 5 spaces — matches "  ── " in FormatKeyspaceHeader
@@ -692,28 +694,43 @@ func WriteStartNoWatch(applyID, database, environment string) {
 
 // ActiveApplyData contains data for a single apply in the status list.
 type ActiveApplyData struct {
-	ApplyID     string
-	Database    string
-	Environment string
-	State       string
-	Engine      string
-	Caller      string
-	StartedAt   string
-	CompletedAt string
-	UpdatedAt   string
-	Volume      int
+	ApplyID      string
+	ExternalID   string
+	Database     string
+	Environment  string
+	State        string
+	Engine       string
+	Caller       string
+	ErrorMessage string
+	StartedAt    string
+	CompletedAt  string
+	UpdatedAt    string
+	Volume       int
 }
 
 // StatusListData contains data for rendering the status list.
 type StatusListData struct {
-	ActiveCount int
-	Applies     []ActiveApplyData
+	ActiveCount    int
+	Limit          int
+	MaxLimit       int
+	HasMore        bool
+	FailuresOnly   bool
+	ShowExternalID bool
+	Applies        []ActiveApplyData
 }
 
 // WriteStatusList writes the status list output.
 func WriteStatusList(data StatusListData) {
 	if len(data.Applies) == 0 {
-		fmt.Printf("%sNo recent schema changes%s\n", ANSIDim, ANSIReset)
+		if data.FailuresOnly {
+			fmt.Printf("%sNo recent failed schema changes%s\n", ANSIDim, ANSIReset)
+		} else {
+			fmt.Printf("%sNo recent schema changes%s\n", ANSIDim, ANSIReset)
+		}
+		return
+	}
+	if data.FailuresOnly {
+		writeFailedStatusList(data)
 		return
 	}
 
@@ -730,14 +747,18 @@ func WriteStatusList(data StatusListData) {
 	fmt.Println()
 
 	// Calculate column widths from data
-	maxID := 8      // "APPLY ID"
-	maxDB := 8      // "DATABASE"
-	maxEnv := 3     // "ENV"
-	maxState := 5   // "STATE"
-	maxStarted := 7 // "STARTED"
-	maxDur := 8     // "DURATION"
+	maxID := 8        // "APPLY ID"
+	maxExternal := 11 // "EXTERNAL ID"
+	maxDB := 8        // "DATABASE"
+	maxEnv := 3       // "ENV"
+	maxState := 5     // "STATE"
+	maxStarted := 7   // "STARTED"
+	maxDur := 8       // "DURATION"
 	for _, a := range data.Applies {
 		maxID = maxLen(maxID, len(a.ApplyID))
+		if data.ShowExternalID {
+			maxExternal = maxLen(maxExternal, len(statusExternalID(a)))
+		}
 		maxDB = maxLen(maxDB, len(a.Database))
 		maxEnv = maxLen(maxEnv, len(a.Environment))
 		maxState = maxLen(maxState, len(state.Label(a.State)))
@@ -746,16 +767,30 @@ func WriteStatusList(data StatusListData) {
 	}
 
 	// Table header
-	fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
-		ANSIDim,
-		maxID, "APPLY ID",
-		maxDB, "DATABASE",
-		maxEnv, "ENV",
-		maxState, "STATE",
-		maxStarted, "STARTED",
-		maxDur, "DURATION",
-		"CALLER",
-		ANSIReset)
+	if data.ShowExternalID {
+		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
+			ANSIDim,
+			maxID, "APPLY ID",
+			maxExternal, "EXTERNAL ID",
+			maxDB, "DATABASE",
+			maxEnv, "ENV",
+			maxState, "STATE",
+			maxStarted, "STARTED",
+			maxDur, "DURATION",
+			"CALLER",
+			ANSIReset)
+	} else {
+		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
+			ANSIDim,
+			maxID, "APPLY ID",
+			maxDB, "DATABASE",
+			maxEnv, "ENV",
+			maxState, "STATE",
+			maxStarted, "STARTED",
+			maxDur, "DURATION",
+			"CALLER",
+			ANSIReset)
+	}
 
 	// Table rows
 	for _, a := range data.Applies {
@@ -767,18 +802,118 @@ func WriteStatusList(data StatusListData) {
 			coloredState = colorFn(padded)
 		}
 
-		fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
-			maxID, a.ApplyID,
-			maxDB, a.Database,
-			maxEnv, a.Environment,
-			coloredState,
-			maxStarted, formatStartedAt(a.StartedAt),
-			maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
-			shortCaller(a.Caller))
+		if data.ShowExternalID {
+			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
+				maxID, a.ApplyID,
+				maxExternal, statusExternalID(a),
+				maxDB, a.Database,
+				maxEnv, a.Environment,
+				coloredState,
+				maxStarted, formatStartedAt(a.StartedAt),
+				maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
+				shortCaller(a.Caller))
+		} else {
+			fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
+				maxID, a.ApplyID,
+				maxDB, a.Database,
+				maxEnv, a.Environment,
+				coloredState,
+				maxStarted, formatStartedAt(a.StartedAt),
+				maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
+				shortCaller(a.Caller))
+		}
 	}
 
+	writeStatusListFooter(data)
+}
+
+func writeStatusListFooter(data StatusListData) {
 	fmt.Println()
+	if data.HasMore && data.Limit > 0 {
+		item := "schema changes"
+		if data.FailuresOnly {
+			item = "failed schema changes"
+		}
+		if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
+			fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
+		} else {
+			fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
+		}
+	}
 	fmt.Printf("%sUse 'schemabot status <apply_id>' to view details%s\n", ANSIDim, ANSIReset)
+}
+
+func writeFailedStatusList(data StatusListData) {
+	fmt.Printf("%sRecent failed schema changes%s\n", ANSIBold, ANSIReset)
+	fmt.Println()
+
+	for i, a := range data.Applies {
+		if i > 0 {
+			fmt.Println()
+		}
+		fmt.Printf("%s %s: %s (%s) [%s] %s\n",
+			a.Database,
+			a.Environment,
+			state.Label(a.State),
+			statusFailureActor(a, data.ShowExternalID),
+			formatFailureTimestamp(a),
+			compactStatusFailureReason(a.ErrorMessage))
+		fmt.Printf("schemabot status %s\n", a.ApplyID)
+	}
+
+	if data.HasMore && data.Limit > 0 {
+		fmt.Println()
+		item := "failed schema changes"
+		if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
+			fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
+		} else {
+			fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
+		}
+	}
+}
+
+func statusExternalID(a ActiveApplyData) string {
+	if a.ExternalID == "" {
+		return "-"
+	}
+	return a.ExternalID
+}
+
+func statusFailureActor(a ActiveApplyData, showExternalID bool) string {
+	caller := shortCaller(a.Caller)
+	if !showExternalID {
+		return caller
+	}
+	return caller + "; external_id=" + statusExternalID(a)
+}
+
+func formatFailureTimestamp(a ActiveApplyData) string {
+	timestamp := a.CompletedAt
+	if timestamp == "" {
+		timestamp = a.UpdatedAt
+	}
+	if timestamp == "" {
+		timestamp = a.StartedAt
+	}
+	if timestamp == "" {
+		return "-"
+	}
+	t, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		return timestamp
+	}
+	return t.UTC().Format("2006-01-02 15:04:05 UTC")
+}
+
+func compactStatusFailureReason(reason string) string {
+	reason = strings.Join(strings.Fields(reason), " ")
+	if reason == "" {
+		return "-"
+	}
+	if len(reason) <= maxStatusFailureReasonWidth {
+		return reason
+	}
+	return reason[:maxStatusFailureReasonWidth-3] + "..."
 }
 
 // formatStartedAt formats the started_at timestamp for display.

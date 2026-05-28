@@ -15,6 +15,7 @@ import (
 
 	gomysql "github.com/go-sql-driver/mysql"
 
+	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -110,6 +111,7 @@ type Service struct {
 	ternClients map[string]tern.Client // keyed by "deployment/environment", lazily created
 	ternMu      sync.Mutex             // protects ternClients
 	logger      *slog.Logger
+	clock       clock.Clock
 
 	// Scheduler loop management.
 	schedulerMu           sync.Mutex
@@ -196,9 +198,27 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		config:                config,
 		ternClients:           ternClients,
 		logger:                logger,
+		clock:                 clock.Real{},
 		schedulerPollInterval: SchedulerPollInterval,
 		pendingObservers:      make(map[pendingObserverKey]tern.ProgressObserver),
 	}
+}
+
+// SetClock overrides the time source used by orchestration loops (currently
+// the scheduler claim-duration measurement). Must be called before
+// StartScheduler — once scheduler workers are running they read s.clock
+// concurrently, so swapping the field is rejected to avoid a data race.
+// Production callers should leave the default clock.Real{} in place; tests
+// use clock.NewFake to make timing observable. A nil or typed-nil c is
+// coalesced to clock.Real{} via clock.Default.
+func (s *Service) SetClock(c clock.Clock) error {
+	s.schedulerMu.Lock()
+	defer s.schedulerMu.Unlock()
+	if s.stopRecovery != nil {
+		return fmt.Errorf("cannot change clock while scheduler is running")
+	}
+	s.clock = clock.Default(c)
+	return nil
 }
 
 // SetSchedulerPollInterval sets the scheduler worker poll interval.

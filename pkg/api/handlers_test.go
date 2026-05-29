@@ -922,46 +922,33 @@ func TestProgressByApplyIDServesQueuedRemoteApplyFromStorage(t *testing.T) {
 	assert.Equal(t, "users", resp.Tables[0].TableName)
 }
 
-func TestProgressByDatabaseServesQueuedRemoteApplyFromStorage(t *testing.T) {
-	// Database-scoped progress uses the same handoff behavior as apply-id
-	// progress: before external_id is persisted, the data plane cannot resolve
-	// the control-plane apply identifier, so the API reports the queued state
-	// from storage.
+func TestProgressByApplyIDResolvesExternalIDForRemoteApply(t *testing.T) {
 	mock := &mockTernClient{
-		isRemote:    true,
-		progressErr: errors.New("remote progress should not be called before external_id is set"),
+		isRemote: true,
+		progressResp: &ternv1.ProgressResponse{
+			ApplyId: "remote-apply-123",
+			State:   ternv1.State_STATE_RUNNING,
+		},
 	}
-	apply := activeTestApply("apply-queued-db")
-	apply.ExternalID = ""
-	apply.State = state.Apply.Running
-	task := &storage.Task{
-		ID:             1,
-		ApplyID:        apply.ID,
-		TaskIdentifier: "task-queued-db",
-		Database:       apply.Database,
-		DatabaseType:   apply.DatabaseType,
-		Environment:    apply.Environment,
-		TableName:      "users",
-		State:          state.Task.Pending,
-		Engine:         storage.EngineSpirit,
-	}
-	svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+	apply := activeTestApply("apply-control-123")
+	apply.ExternalID = "remote-apply-123"
+	svc := newControlTestService(mock, apply)
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/testdb?environment=staging", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-control-123", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	assert.Nil(t, mock.progressReq, "remote progress should wait until scheduler stores external_id")
+	require.NotNil(t, mock.progressReq)
+	assert.Equal(t, "remote-apply-123", mock.progressReq.ApplyId)
+	assert.Equal(t, "staging", mock.progressReq.Environment)
 
 	var resp apitypes.ProgressResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Equal(t, "apply-queued-db", resp.ApplyID)
-	assert.Equal(t, state.Apply.Pending, resp.State)
-	require.Len(t, resp.Tables, 1)
-	assert.Equal(t, "users", resp.Tables[0].TableName)
+	assert.Equal(t, "apply-control-123", resp.ApplyID)
+	assert.Equal(t, state.Apply.Running, resp.State)
 }
 
 func TestExecuteApplyQueuesLocalApplyForScheduler(t *testing.T) {

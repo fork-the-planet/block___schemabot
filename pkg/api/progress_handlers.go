@@ -183,155 +183,6 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 	return httpResp
 }
 
-// GetProgress fetches the current progress for a database from its tern client.
-// This is used by the webhook handler to populate table-level progress in PR comments.
-func (s *Service) GetProgress(ctx context.Context, database, environment string) (*apitypes.ProgressResponse, error) {
-	ternApplyID, activeApply, err := s.findActiveApplyID(ctx, database, environment)
-	if err != nil {
-		return nil, fmt.Errorf("resolve active apply for %s: %w", database, err)
-	}
-
-	// Use deployment from the stored apply if available; otherwise route by
-	// the server-side database target registry for this environment.
-	deployment := ""
-	if activeApply != nil {
-		if shouldServeProgressFromStorage(activeApply.State) {
-			return s.progressFromLocalStorage(ctx, activeApply)
-		}
-		deployment = activeApply.Deployment
-	}
-	deployment, err = s.deploymentForDatabaseEnvironment(database, deployment, environment)
-	if err != nil {
-		return nil, fmt.Errorf("resolve deployment for %s/%s: %w", database, environment, err)
-	}
-
-	client, err := s.TernClient(deployment, environment)
-	if err != nil {
-		return nil, fmt.Errorf("get tern client for %s/%s: %w", database, environment, err)
-	}
-	if shouldServeRemoteProgressFromStorage(activeApply, client) {
-		return s.progressFromLocalStorage(ctx, queuedRemoteProgressApply(activeApply))
-	}
-
-	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:  ternApplyID,
-		Database: database,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("progress for %s: %w", database, err)
-	}
-
-	httpResp := progressResponseFromProto(resp)
-	httpResp.Database = database
-	httpResp.Environment = environment
-
-	if activeApply != nil {
-		httpResp.ApplyID = activeApply.ApplyIdentifier
-		overlayApplyOptions(httpResp, activeApply)
-		s.overlayVitessMetadata(ctx, httpResp, activeApply)
-	}
-
-	return httpResp, nil
-}
-
-// handleProgress handles GET /api/progress/{database} requests.
-func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
-	database := r.PathValue("database")
-	if database == "" {
-		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "database is required")
-		return
-	}
-
-	s.logger.Info("progress by database", "database", database)
-	environment := r.URL.Query().Get("environment")
-	if environment == "" {
-		environment = "staging"
-	}
-
-	// Resolve the Tern-facing apply_id. Prefer explicit apply_id query param
-	// (resolves external_id from storage), fall back to active apply lookup.
-	var ternApplyID string
-	var activeApply *storage.Apply
-	if qApplyID := r.URL.Query().Get("apply_id"); qApplyID != "" {
-		resolved, err := s.resolveApplyID(r.Context(), qApplyID)
-		if err != nil {
-			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to resolve apply_id: "+err.Error())
-			return
-		}
-		ternApplyID = resolved
-		activeApply, _ = s.storage.Applies().GetByApplyIdentifier(r.Context(), qApplyID)
-	} else {
-		var err error
-		ternApplyID, activeApply, err = s.findActiveApplyID(r.Context(), database, environment)
-		if err != nil {
-			s.logger.Error("failed to look up active apply from storage", "database", database, "environment", environment, "error", err)
-			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to look up active apply: "+err.Error())
-			return
-		}
-	}
-
-	if activeApply != nil && shouldServeProgressFromStorage(activeApply.State) {
-		httpResp, err := s.progressFromLocalStorage(r.Context(), activeApply)
-		if err != nil {
-			s.logger.Error("failed to read apply progress from storage", "apply_id", activeApply.ApplyIdentifier, "state", activeApply.State, "error", err)
-			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read apply: "+err.Error())
-			return
-		}
-		s.writeJSON(w, http.StatusOK, httpResp)
-		return
-	}
-
-	// Deployment is a plan-time decision stored on the apply record. If no
-	// apply record exists yet, route by the server-side database target config.
-	var deployment string
-	if activeApply != nil && activeApply.Deployment != "" {
-		deployment = activeApply.Deployment
-	}
-	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
-	if err != nil {
-		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound, err.Error())
-		return
-	}
-
-	client, err := s.TernClient(deployment, environment)
-	if err != nil {
-		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound, err.Error())
-		return
-	}
-	if shouldServeRemoteProgressFromStorage(activeApply, client) {
-		httpResp, err := s.progressFromLocalStorage(r.Context(), queuedRemoteProgressApply(activeApply))
-		if err != nil {
-			s.logger.Error("failed to read queued remote apply progress from storage",
-				"apply_id", activeApply.ApplyIdentifier, "state", activeApply.State, "error", err)
-			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read apply: "+err.Error())
-			return
-		}
-		s.writeJSON(w, http.StatusOK, httpResp)
-		return
-	}
-
-	resp, err := client.Progress(r.Context(), &ternv1.ProgressRequest{
-		ApplyId:  ternApplyID,
-		Database: database,
-	})
-	if err != nil {
-		s.logger.Error("progress failed", "database", database, "error", err)
-		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeEngineUnavailable, "progress failed: "+err.Error())
-		return
-	}
-
-	httpResp := progressResponseFromProto(resp)
-
-	// Overlay apply metadata from storage.
-	if activeApply != nil {
-		httpResp.ApplyID = activeApply.ApplyIdentifier
-		overlayApplyOptions(httpResp, activeApply)
-		s.overlayVitessMetadata(r.Context(), httpResp, activeApply)
-	}
-
-	s.writeJSON(w, http.StatusOK, httpResp)
-}
-
 // handleProgressByApplyID handles GET /api/progress/apply/{apply_id} requests.
 // Returns progress for a specific apply by its external identifier.
 func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request) {
@@ -397,15 +248,9 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Resolve to the Tern-facing ID: external_id (remote engine's apply identifier) or apply_identifier (local mode).
-	ternApplyID := apply.ApplyIdentifier
-	if apply.ExternalID != "" {
-		ternApplyID = apply.ExternalID
-	}
-
 	resp, err := client.Progress(r.Context(), &ternv1.ProgressRequest{
-		ApplyId:  ternApplyID,
-		Database: apply.Database,
+		ApplyId:     ternApplyIDForStoredApply(apply),
+		Environment: apply.Environment,
 	})
 	if err != nil {
 		s.logger.Error("progress failed", "apply_id", applyID, "database", apply.Database, "error", err)
@@ -813,8 +658,8 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 	}
 
 	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:  apply.ExternalID,
-		Database: apply.Database,
+		ApplyId:     apply.ExternalID,
+		Environment: apply.Environment,
 	})
 	if err != nil {
 		return fmt.Errorf("progress RPC: %w", err)

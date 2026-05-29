@@ -488,10 +488,11 @@ func (m *mockPlanStore) GetByID(context.Context, int64) (*storage.Plan, error) {
 // mockStorage wires together the mock stores.
 type mockStorage struct {
 	storage.Storage
-	applies *mockApplyStore
-	tasks   *mockTaskStore
-	plans   *mockPlanStore
-	logs    *mockApplyLogStore
+	applies         *mockApplyStore
+	tasks           *mockTaskStore
+	plans           *mockPlanStore
+	logs            *mockApplyLogStore
+	controlRequests *testControlRequestStore
 }
 
 func (m *mockStorage) Applies() storage.ApplyStore {
@@ -517,6 +518,12 @@ func (m *mockStorage) ApplyLogs() storage.ApplyLogStore {
 		return m.logs
 	}
 	return &mockApplyLogStore{}
+}
+func (m *mockStorage) ControlRequests() storage.ControlRequestStore {
+	if m.controlRequests != nil {
+		return m.controlRequests
+	}
+	return &testControlRequestStore{}
 }
 
 func testCapturingGRPCClient(t *testing.T, server *capturingTernServer) (*GRPCClient, func()) {
@@ -1502,6 +1509,164 @@ func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
 	// Progress returns STATE_COMPLETED after Start, so ResumeApply exits after
 	// syncing one terminal progress response.
 	assert.Equal(t, "remote_tern_xyz", server.getProgressApplyID())
+}
+
+func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
+	// A scheduler claim can move the apply row before the worker calls remote
+	// Start. The durable control request lets a later worker recover that
+	// intent and validate the remote stopped state.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-start-claimed",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-start-claimed",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.NoError(t, err)
+
+	assert.Equal(t, "remote-start-claimed", server.getStartApplyID())
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq)
+}
+
+func TestGRPCClient_ResumeApplyCompletesQueuedStartWhenRemoteAlreadyActive(t *testing.T) {
+	// An operator can start the remote apply directly after SchemaBot records
+	// durable start intent. The scheduler adopts the active remote state instead
+	// of sending another Start request, then continues polling the exact apply ID.
+	server := &capturingTernServer{
+		progressStates: []ternv1.State{
+			ternv1.State_STATE_RUNNING,
+			ternv1.State_STATE_COMPLETED,
+		},
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-start-already-active",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-start-already-active",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             31,
+		TaskIdentifier: "task-start-already-active",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		Namespace:      "default",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	err := client.ResumeApply(ctx, apply)
+	require.NoError(t, err)
+
+	server.mu.Lock()
+	startCalled := server.startCalled
+	server.mu.Unlock()
+	assert.False(t, startCalled, "Start should not be called after remote progress reports active work")
+	assert.Equal(t, "remote-start-already-active", server.getProgressApplyID())
+	assert.Equal(t, state.Apply.Completed, apply.State)
+	assert.Equal(t, state.Task.Completed, task.State)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq)
+}
+
+func TestGRPCClient_ReconcileStoppedRemoteProgressKeepsQueuedStartPending(t *testing.T) {
+	// A Start request can be accepted while an older worker is still recording
+	// the remote stop. The stop sync must not consume the pending Start intent;
+	// the scheduler needs that durable request to claim and resume the apply.
+	now := time.Now()
+	remoteApply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-stop-with-pending-start",
+		ExternalID:      "remote-stop-with-pending-start",
+		Database:        "testdb",
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+		StartedAt:       &now,
+	}
+	storedApply := *remoteApply
+	storedApply.State = state.Apply.Running
+	task := &storage.Task{
+		ID:             31,
+		TaskIdentifier: "task-stop-with-pending-start",
+		ApplyID:        remoteApply.ID,
+		TableName:      "users",
+		Namespace:      "default",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   remoteApply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	client := &GRPCClient{
+		storage: &mockStorage{
+			applies:         &mockApplyStore{apply: &storedApply},
+			tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+	}
+
+	err := client.reconcileTerminalRemoteProgress(t.Context(), remoteApply, []*ternv1.TableProgress{{
+		Namespace: "default",
+		TableName: "users",
+		Status:    state.Task.Stopped,
+	}}, now)
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Apply.Stopped, remoteApply.State)
+	assert.Equal(t, state.Task.Stopped, task.State)
+	controlReq, err := controlRequests.GetPending(t.Context(), remoteApply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, controlReq)
 }
 
 // TestGRPCClient_ResumeApply_SkipsStartWhenNotStopped verifies that ResumeApply

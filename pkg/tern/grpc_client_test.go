@@ -347,10 +347,12 @@ type capturingTernServer struct {
 	remoteApplyID    string
 	startApplyID     string
 	progressApplyID  string
+	progressReq      *ternv1.ProgressRequest
 	progressState    ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
 	progressStateSet bool
 	progressStates   []ternv1.State
 	progressTables   []*ternv1.TableProgress
+	progressError    string
 	progressErr      error
 	startCalled      bool // tracks whether Start was actually invoked
 }
@@ -382,6 +384,10 @@ func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest)
 
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
+	s.progressReq = &ternv1.ProgressRequest{
+		ApplyId:     req.ApplyId,
+		Environment: req.Environment,
+	}
 	s.progressApplyID = req.ApplyId
 	ps := s.progressState
 	psSet := s.progressStateSet
@@ -391,6 +397,7 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 		psSet = true
 	}
 	tables := s.progressTables
+	errorMessage := s.progressError
 	err := s.progressErr
 	s.mu.Unlock()
 	if err != nil {
@@ -399,7 +406,7 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 	if !psSet {
 		ps = ternv1.State_STATE_COMPLETED
 	}
-	return &ternv1.ProgressResponse{State: ps, Tables: tables}, nil
+	return &ternv1.ProgressResponse{State: ps, Tables: tables, ErrorMessage: errorMessage}, nil
 }
 
 func (s *capturingTernServer) getStartApplyID() string {
@@ -412,6 +419,18 @@ func (s *capturingTernServer) getProgressApplyID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.progressApplyID
+}
+
+func (s *capturingTernServer) getProgressRequest() *ternv1.ProgressRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.progressReq == nil {
+		return nil
+	}
+	return &ternv1.ProgressRequest{
+		ApplyId:     s.progressReq.ApplyId,
+		Environment: s.progressReq.Environment,
+	}
 }
 
 func (s *capturingTernServer) getApplyRequest() *ternv1.ApplyRequest {
@@ -620,6 +639,10 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
 	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_ALTER, req.DdlChanges[0].ChangeType)
 	assert.Equal(t, "remote-dispatched-123", server.getProgressApplyID())
+	progressReq := server.getProgressRequest()
+	require.NotNil(t, progressReq)
+	assert.Equal(t, "remote-dispatched-123", progressReq.ApplyId)
+	assert.Equal(t, "staging", progressReq.Environment)
 }
 
 func TestGRPCClient_ResumeApplyLogsRemoteLifecycle(t *testing.T) {
@@ -697,6 +720,175 @@ func TestGRPCClient_ResumeApplyLogsRemoteLifecycle(t *testing.T) {
 	require.NotNil(t, dispatchLog, "dispatch log should be present")
 	assert.Equal(t, state.Apply.Pending, dispatchLog.OldState)
 	assert.Equal(t, state.Apply.Running, dispatchLog.NewState)
+}
+
+func TestGRPCClient_ResumeApplyPersistsRemoteFailureMessage(t *testing.T) {
+	// Remote Tern failures should be copied into control-plane storage and logs
+	// so status and logs explain the failed schema change without data-plane logs.
+	server := &capturingTernServer{
+		remoteApplyID:    "remote-failed-123",
+		progressState:    ternv1.State_STATE_FAILED,
+		progressStateSet: true,
+		progressError:    "failed to connect to target database",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Failed,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              18,
+		ApplyIdentifier: "apply-control-failed",
+		PlanID:          110,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Deployment:      "us-west",
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	task := &storage.Task{
+		ID:             22,
+		TaskIdentifier: "task-failed",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		DDL:            "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:      "alter",
+		Namespace:      "default",
+		State:          state.Task.Pending,
+	}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-remote-failed",
+		}},
+		logs: logs,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	err := client.ResumeApply(ctx, apply)
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Equal(t, "failed to connect to target database", apply.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, task.State)
+	progressReq := server.getProgressRequest()
+	require.NotNil(t, progressReq)
+	assert.Equal(t, "remote-failed-123", progressReq.ApplyId)
+	assert.Equal(t, "staging", progressReq.Environment)
+
+	var terminalLog *storage.ApplyLog
+	for _, log := range logs.logs {
+		if strings.Contains(log.Message, "Remote apply reached terminal state: failed") {
+			terminalLog = log
+			break
+		}
+	}
+	require.NotNil(t, terminalLog, "expected failed terminal state log")
+	assert.Equal(t, storage.LogLevelError, terminalLog.Level)
+	assert.Contains(t, terminalLog.Message, "failed to connect to target database")
+}
+
+func TestGRPCClient_ProgressPollTerminalErrorFailsApply(t *testing.T) {
+	// Permanent progress RPC errors mean the control plane cannot observe the
+	// remote apply. The apply should fail with that error instead of polling
+	// forever and leaving operators with an in-progress status.
+	server := &capturingTernServer{
+		progressErr: status.Error(codes.InvalidArgument, `invalid apply_id "apply-remote": strconv.ParseInt: invalid syntax`),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              24,
+		ApplyIdentifier: "apply-terminal-progress-error",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Deployment:      "us-west",
+		Environment:     "staging",
+		ExternalID:      "apply-remote",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             30,
+		TaskIdentifier: "task-terminal-progress-error",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    logs,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid apply_id")
+
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "invalid apply_id")
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, task.ErrorMessage, "invalid apply_id")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply failed: remote progress failed"))
+}
+
+func TestGRPCClient_ProgressPollRepeatedRetryableErrorsPauseApply(t *testing.T) {
+	// Retryable progress RPC errors can happen while the remote service is
+	// unavailable. After repeated failures, the apply should pause for scheduler
+	// recovery and expose the polling error through status and logs.
+	server := &capturingTernServer{
+		progressErr: status.Error(codes.Unavailable, "remote service unavailable"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              25,
+		ApplyIdentifier: "apply-retryable-progress-error",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "us-west",
+		Environment:     "staging",
+		ExternalID:      "remote-retryable",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             31,
+		TaskIdentifier: "task-retryable-progress-error",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    logs,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote service unavailable")
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "remote progress polling failed after 10 consecutive errors")
+	assert.Nil(t, apply.CompletedAt)
+	assert.Equal(t, state.Task.FailedRetryable, task.State)
+	assert.Contains(t, task.ErrorMessage, "remote progress polling failed after 10 consecutive errors")
+	assert.Nil(t, task.CompletedAt)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply failed: remote progress polling failed after 10 consecutive errors"))
 }
 
 func TestGRPCClient_ResumeApplyDoesNotRegressRunningApplyToPendingProgress(t *testing.T) {
@@ -1815,9 +2007,53 @@ func TestGRPCClient_ResumeApplyFailsWhenStoppedRemoteHasNoActiveProgress(t *test
 	startCalled := server.startCalled
 	server.mu.Unlock()
 	assert.False(t, startCalled, "Start should not be called when the remote apply is missing")
-	assert.Equal(t, state.Apply.Stopped, apply.State)
-	assert.Equal(t, state.Task.Stopped, task.State)
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote stopped-state check returned no active schema change"))
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "no active schema change")
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, task.ErrorMessage, "no active schema change")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply failed: remote apply remote-stopped-no-active returned no active schema change"))
+}
+
+func TestGRPCClient_ResumeApplyFailsWhenStoppedRemoteIsNotFound(t *testing.T) {
+	// A stored stopped apply with a missing exact remote apply ID is inconsistent
+	// cross-plane state. Fail the stored apply instead of leaving it resumable.
+	server := &capturingTernServer{
+		progressErr: status.Error(codes.NotFound, "apply not found"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-stopped-not-found",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-stopped-not-found",
+		State:           state.Apply.Stopped,
+	}
+	task := &storage.Task{
+		ID:             12,
+		TaskIdentifier: "task-stopped-not-found",
+		State:          state.Task.Stopped,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    &mockApplyLogStore{},
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply not found")
+
+	server.mu.Lock()
+	startCalled := server.startCalled
+	server.mu.Unlock()
+	assert.False(t, startCalled, "Start should not be called when the remote apply is missing")
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "remote-stopped-not-found")
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, task.ErrorMessage, "remote-stopped-not-found")
 }
 
 func TestGRPCClient_PollFailsWhenRemoteApplyIsNotFound(t *testing.T) {

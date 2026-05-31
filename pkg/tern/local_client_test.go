@@ -76,11 +76,11 @@ type fakeControlEngine struct {
 func (e *fakeControlEngine) Name() string { return "fake" }
 
 func (e *fakeControlEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
-	return nil, nil
+	return &engine.PlanResult{}, nil
 }
 
 func (e *fakeControlEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
-	return nil, nil
+	return &engine.ApplyResult{Accepted: true}, nil
 }
 
 func (e *fakeControlEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
@@ -132,6 +132,32 @@ func (s *exactProgressStorage) ControlRequests() storage.ControlRequestStore {
 	return s.controlRequests
 }
 
+func TestApplyCancelHandleDoesNotCancelNewerOwner(t *testing.T) {
+	client := &LocalClient{}
+	oldCtx, oldCancel := context.WithCancel(t.Context())
+	oldGeneration := client.setApplyCancel(oldCancel)
+	oldHandle := client.currentApplyCancel()
+
+	newCtx, newCancel := context.WithCancel(t.Context())
+	defer newCancel()
+	newGeneration := client.setApplyCancel(newCancel)
+
+	client.cancelApplyHandle(oldHandle)
+	assert.Equal(t, oldGeneration, oldHandle.generation)
+	require.Eventually(t, func() bool {
+		return oldCtx.Err() != nil
+	}, time.Second, 10*time.Millisecond)
+	assert.NoError(t, newCtx.Err())
+
+	client.clearApplyCancel(oldGeneration)
+	currentHandle := client.currentApplyCancel()
+	assert.Equal(t, newGeneration, currentHandle.generation)
+	assert.NotNil(t, currentHandle.cancel)
+
+	client.clearApplyCancel(newGeneration)
+	assert.Nil(t, client.currentApplyCancel().cancel)
+}
+
 type testControlRequestStore struct {
 	storage.ControlRequestStore
 	requests []*storage.ApplyControlRequest
@@ -171,6 +197,16 @@ func (s *testControlRequestStore) CompletePending(_ context.Context, applyID int
 	for _, req := range s.requests {
 		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {
 			req.Status = storage.ControlRequestCompleted
+		}
+	}
+	return nil
+}
+
+func (s *testControlRequestStore) FailPending(_ context.Context, applyID int64, operation storage.ControlOperation, errorMessage string) error {
+	for _, req := range s.requests {
+		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {
+			req.Status = storage.ControlRequestFailed
+			req.ErrorMessage = errorMessage
 		}
 	}
 	return nil

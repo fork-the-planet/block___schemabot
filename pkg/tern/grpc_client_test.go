@@ -355,6 +355,7 @@ type capturingTernServer struct {
 	progressTables   []*ternv1.TableProgress
 	progressError    string
 	progressErr      error
+	startErr         error
 	startCalled      bool // tracks whether Start was actually invoked
 }
 
@@ -377,6 +378,11 @@ func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest)
 	s.mu.Lock()
 	s.startApplyID = req.ApplyId
 	s.startCalled = true
+	err := s.startErr
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
 	// After Start succeeds, transition to COMPLETED so the poller exits.
 	s.progressState = ternv1.State_STATE_COMPLETED
 	s.mu.Unlock()
@@ -845,7 +851,7 @@ func TestGRPCClient_ProgressPollTerminalErrorFailsApply(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid apply_id")
 
@@ -892,7 +898,7 @@ func TestGRPCClient_ProgressPollRepeatedRetryableErrorsPauseApply(t *testing.T) 
 
 	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "remote service unavailable")
 
@@ -903,6 +909,68 @@ func TestGRPCClient_ProgressPollRepeatedRetryableErrorsPauseApply(t *testing.T) 
 	assert.Contains(t, task.ErrorMessage, "remote progress polling failed after 10 consecutive errors")
 	assert.Nil(t, task.CompletedAt)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply failed: remote progress polling failed after 10 consecutive errors"))
+}
+
+func TestGRPCClient_ProgressPollBoundsStoppedAfterStart(t *testing.T) {
+	// A scheduler-owned start may briefly see the remote stopped state from the
+	// preceding stop, but that grace period must end with a stored stopped result
+	// instead of an unbounded polling loop.
+	originalGracePeriod := grpcStoppedAfterStartGracePeriod
+	grpcStoppedAfterStartGracePeriod = 0
+	t.Cleanup(func() { grpcStoppedAfterStartGracePeriod = originalGracePeriod })
+
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Stopped,
+			PercentComplete: 40,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              26,
+		ApplyIdentifier: "apply-stopped-after-start",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Deployment:      "us-west",
+		Environment:     "staging",
+		ExternalID:      "remote-stopped-after-start",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             32,
+		TaskIdentifier: "task-stopped-after-start",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: &storedApply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    logs,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "start accepted")
+	assert.Contains(t, err.Error(), "remained stopped after start grace period")
+
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "remained stopped after start grace period")
+	assert.Equal(t, state.Task.Stopped, task.State)
+	assert.Equal(t, 40, task.ProgressPercent)
+	assert.True(t, hasLogMessageContaining(logs.logs, "remote apply remote-stopped-after-start remained stopped after start grace period"))
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply reached terminal state: stopped"))
 }
 
 func TestGRPCClient_ResumeApplyDoesNotRegressRunningApplyToPendingProgress(t *testing.T) {
@@ -997,6 +1065,12 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 			expected:    state.Apply.Completed,
 		},
 		{
+			name:        "stored stopped state is final without start ownership",
+			storedState: state.Apply.Stopped,
+			remoteState: state.Apply.Running,
+			expected:    state.Apply.Stopped,
+		},
+		{
 			name:        "stored retryable failure blocks active progress",
 			storedState: state.Apply.FailedRetryable,
 			remoteState: state.Apply.Running,
@@ -1018,9 +1092,13 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.expected, applyStateFromRemoteProgress(tc.storedState, tc.remoteState))
+			assert.Equal(t, tc.expected, applyStateFromRemoteProgress(tc.storedState, tc.remoteState, false))
 		})
 	}
+
+	assert.Equal(t, state.Apply.Running,
+		applyStateFromRemoteProgress(state.Apply.Stopped, state.Apply.Running, true),
+		"a scheduler-owned start may adopt active remote progress after a stale stopped write")
 }
 
 func TestGRPCClient_SyncStoredTasksFromRemoteTasksUsesRemoteTaskState(t *testing.T) {
@@ -1259,7 +1337,7 @@ func TestGRPCClient_PollSetsTerminalTaskMetadataFromRemoteTaskProgress(t *testin
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, state.Task.Completed, task.State)
@@ -1301,7 +1379,7 @@ func TestGRPCClient_PollReturnsErrorWhenTerminalRemoteApplyLeavesStoredTaskActiv
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "stored task task-terminal-missing-state is still running")
 	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
@@ -1346,7 +1424,7 @@ func TestGRPCClient_PollReturnsTerminalStorageUpdateError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "update terminal remote gRPC apply")
 	assert.Contains(t, err.Error(), "storage unavailable")
@@ -1382,7 +1460,7 @@ func TestGRPCClient_PollKeepsApplyActiveWhenTerminalTaskLoadFails(t *testing.T) 
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "load tasks to sync terminal gRPC progress")
 	assert.Contains(t, err.Error(), "task storage unavailable")
@@ -1425,7 +1503,7 @@ func TestGRPCClient_PollSkipsTaskFinalizationWhenStoredApplyAlreadyTerminal(t *t
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, state.Apply.Failed, apply.State)
@@ -1756,6 +1834,71 @@ func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
 	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
+}
+
+func TestGRPCClient_ResumeApplyStartErrorLeavesApplyStopped(t *testing.T) {
+	// When the scheduler accepts a stored start request but remote Tern rejects
+	// the Start RPC, keep the apply stopped with a visible reason and leave the
+	// start request pending for a later retry/reconciliation attempt.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Stopped,
+			PercentComplete: 35,
+		}},
+		startErr: status.Error(codes.Unavailable, "remote start unavailable"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-start-error",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		ExternalID:      "remote-start-error",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             2,
+		TaskIdentifier: "task-start-error",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Stopped,
+	}
+	logs := &mockApplyLogStore{}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote start unavailable")
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "remote start failed")
+	assert.Equal(t, state.Task.Stopped, task.State)
+	assert.Equal(t, 35, task.ProgressPercent)
+	assert.True(t, hasLogMessageContaining(logs.logs, "remote start failed for remote apply remote-start-error"))
+	pendingStart, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStart)
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+	assert.Contains(t, controlRequests.requests[0].ErrorMessage, "remote start failed")
 }
 
 func TestGRPCClient_ResumeApplyProcessesQueuedStop(t *testing.T) {
@@ -2158,7 +2301,7 @@ func TestGRPCClient_PollFailsWhenRemoteApplyIsNotFound(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "remote-not-found")
 
@@ -2199,7 +2342,7 @@ func TestGRPCClient_PollFailsWhenExactRemoteApplyHasNoActiveProgress(t *testing.
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no active schema change")
 
@@ -2237,7 +2380,7 @@ func TestGRPCClient_PollFailsWhenRemoteApplyStateIsUnmapped(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unmapped remote state")
 	assert.Equal(t, state.Apply.Running, apply.State)
@@ -2281,7 +2424,7 @@ func TestGRPCClient_RemoteProgressLossDoesNotOverwriteTerminalApply(t *testing.T
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 
 	assert.Equal(t, state.Apply.Completed, apply.State)

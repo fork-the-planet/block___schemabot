@@ -59,6 +59,17 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Build PlanRequest in the format expected by the API service
 	prNumber := int32(pr)
+	deployment := ""
+	if resolvedTarget, err := h.service.Config().ResolveDatabaseTarget(schemaResult.Database, environment); err != nil {
+		h.logger.Warn("plan metric deployment is unknown because target resolution failed",
+			"repo", repo,
+			"pr", pr,
+			"database", schemaResult.Database,
+			"environment", environment,
+			"error", err)
+	} else {
+		deployment = resolvedTarget.Deployment
+	}
 	planReq := api.PlanRequest{
 		Database:      schemaResult.Database,
 		Environment:   environment,
@@ -74,12 +85,13 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Execute plan via the service
 	planResp, err := h.service.ExecutePlan(ctx, planReq)
 	if err != nil {
-		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
-		metrics.RecordPlan(ctx, repo, schemaResult.Database, environment, "error")
+		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", err)
+		metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "error")
+		userError := userFacingError(err)
 		h.postFailingAggregates(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{
-			environment: userFacingError(err),
+			environment: userError,
 		})
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userError)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan failed"})
 		return
 	}
@@ -87,7 +99,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
 
-	metrics.RecordPlan(ctx, repo, schemaResult.Database, environment, "success")
+	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
 
 	// Post plan comment
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
@@ -95,7 +107,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Store per-database check record and update aggregate
 	headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 	if checkErr != nil {
-		h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "error", checkErr)
+		h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", checkErr)
 	}
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
@@ -403,10 +415,4 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 	data.Errors = planResp.Errors
 
 	return data
-}
-
-// userFacingError returns the error message as-is. Detailed errors are logged
-// server-side; the PR comment shows the full chain so users can report issues.
-func userFacingError(err error) string {
-	return err.Error()
 }

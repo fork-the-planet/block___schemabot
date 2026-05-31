@@ -16,7 +16,19 @@ import (
 // Meter name used for all SchemaBot metrics.
 const meterName = "schemabot"
 
-const unknownEnvironment = "unknown"
+const (
+	unknownDeployment  = "unknown"
+	unknownEnvironment = "unknown"
+)
+
+// DeploymentAttribute returns the canonical deployment metric attribute.
+// Use "unknown" when the request fails before SchemaBot resolves routing.
+func DeploymentAttribute(deployment string) attribute.KeyValue {
+	if deployment == "" {
+		deployment = unknownDeployment
+	}
+	return attribute.String("deployment", deployment)
+}
 
 // EnvironmentAttribute returns the canonical environment metric attribute.
 // Use "unknown" for process-wide or integration metrics that do not belong to
@@ -28,12 +40,12 @@ func EnvironmentAttribute(environment string) attribute.KeyValue {
 	return attribute.String("environment", environment)
 }
 
-// RecordPlan increments the plans counter with database, environment, and status attributes.
+// RecordPlan increments the plans counter with database, deployment, environment, and status attributes.
 // Status should be "success" or "error".
 //
 // The OTel SDK deduplicates instruments with the same name, so repeated calls
 // to Int64Counter are cheap after the first registration.
-func RecordPlan(ctx context.Context, repo, database, environment, status string) {
+func RecordPlan(ctx context.Context, repo, database, deployment, environment, status string) {
 	meter := otel.Meter(meterName)
 	counter, err := meter.Int64Counter("schemabot.plans.total",
 		otelmetric.WithDescription("Total number of plan operations"),
@@ -47,6 +59,7 @@ func RecordPlan(ctx context.Context, repo, database, environment, status string)
 		otelmetric.WithAttributes(
 			attribute.String("repository", repo),
 			attribute.String("database", database),
+			DeploymentAttribute(deployment),
 			EnvironmentAttribute(environment),
 			attribute.String("status", status),
 		),
@@ -54,7 +67,7 @@ func RecordPlan(ctx context.Context, repo, database, environment, status string)
 }
 
 // RecordPlanDuration records the duration of a plan operation.
-func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, database, environment, status string) {
+func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {
 	meter := otel.Meter(meterName)
 	hist, err := meter.Float64Histogram("schemabot.plan.duration_seconds",
 		otelmetric.WithDescription("Duration of plan operations"),
@@ -68,15 +81,16 @@ func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, datab
 		otelmetric.WithAttributes(
 			attribute.String("repository", repo),
 			attribute.String("database", database),
+			DeploymentAttribute(deployment),
 			EnvironmentAttribute(environment),
 			attribute.String("status", status),
 		),
 	)
 }
 
-// RecordApply increments the applies counter with database, environment, and status attributes.
+// RecordApply increments the applies counter with database, deployment, environment, and status attributes.
 // Status should be "success", "error", "rejected", or "conflict".
-func RecordApply(ctx context.Context, repo, database, environment, status string) {
+func RecordApply(ctx context.Context, repo, database, deployment, environment, status string) {
 	meter := otel.Meter(meterName)
 	counter, err := meter.Int64Counter("schemabot.applies.total",
 		otelmetric.WithDescription("Total number of apply operations"),
@@ -90,6 +104,7 @@ func RecordApply(ctx context.Context, repo, database, environment, status string
 		otelmetric.WithAttributes(
 			attribute.String("repository", repo),
 			attribute.String("database", database),
+			DeploymentAttribute(deployment),
 			EnvironmentAttribute(environment),
 			attribute.String("status", status),
 		),
@@ -98,7 +113,7 @@ func RecordApply(ctx context.Context, repo, database, environment, status string
 
 // RecordApplyDuration records the duration of an apply operation (API call time,
 // not the full Spirit run which can take hours).
-func RecordApplyDuration(ctx context.Context, duration time.Duration, repo, database, environment, status string) {
+func RecordApplyDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {
 	meter := otel.Meter(meterName)
 	hist, err := meter.Float64Histogram("schemabot.apply.duration_seconds",
 		otelmetric.WithDescription("Duration of apply operations (API call time)"),
@@ -112,6 +127,7 @@ func RecordApplyDuration(ctx context.Context, duration time.Duration, repo, data
 		otelmetric.WithAttributes(
 			attribute.String("repository", repo),
 			attribute.String("database", database),
+			DeploymentAttribute(deployment),
 			EnvironmentAttribute(environment),
 			attribute.String("status", status),
 		),
@@ -307,7 +323,7 @@ var knownCheckOwnershipOperations = map[string]bool{
 // RecordCheckOwnershipMiss increments the counter for guarded check updates
 // that did not apply because stored check state no longer belonged to the
 // apply being completed.
-func RecordCheckOwnershipMiss(ctx context.Context, operation, repository, database, databaseType, environment string) {
+func RecordCheckOwnershipMiss(ctx context.Context, operation, repository, database, databaseType, deployment, environment string) {
 	if !knownCheckOwnershipOperations[operation] {
 		operation = "unknown"
 	}
@@ -326,6 +342,7 @@ func RecordCheckOwnershipMiss(ctx context.Context, operation, repository, databa
 			attribute.String("repository", repository),
 			attribute.String("database", database),
 			attribute.String("database_type", databaseType),
+			DeploymentAttribute(deployment),
 			EnvironmentAttribute(environment),
 		),
 	)
@@ -333,7 +350,7 @@ func RecordCheckOwnershipMiss(ctx context.Context, operation, repository, databa
 
 // AdjustActiveApplies increments or decrements the active applies gauge.
 // Use delta=1 when an apply is accepted and delta=-1 when it reaches a terminal state.
-func AdjustActiveApplies(ctx context.Context, delta int64, database, environment string) {
+func AdjustActiveApplies(ctx context.Context, delta int64, database, deployment, environment string) {
 	meter := otel.Meter(meterName)
 	counter, err := meter.Int64UpDownCounter("schemabot.active_applies",
 		otelmetric.WithDescription("Number of currently in-progress applies"),
@@ -346,6 +363,7 @@ func AdjustActiveApplies(ctx context.Context, delta int64, database, environment
 	counter.Add(ctx, delta,
 		otelmetric.WithAttributes(
 			attribute.String("database", database),
+			DeploymentAttribute(deployment),
 			EnvironmentAttribute(environment),
 		),
 	)
@@ -365,7 +383,7 @@ var knownControlOperations = map[string]bool{
 // RecordControlOperation increments the control operations counter.
 // Operation should be one of: cutover, stop, start, volume, revert, skip_revert, rollback_plan.
 // Status should be "success" or "error".
-func RecordControlOperation(ctx context.Context, operation, database, environment, status string) {
+func RecordControlOperation(ctx context.Context, operation, database, deployment, environment, status string) {
 	if !knownControlOperations[operation] {
 		operation = "unknown"
 	}
@@ -382,6 +400,7 @@ func RecordControlOperation(ctx context.Context, operation, database, environmen
 		otelmetric.WithAttributes(
 			attribute.String("operation", operation),
 			attribute.String("database", database),
+			DeploymentAttribute(deployment),
 			EnvironmentAttribute(environment),
 			attribute.String("status", status),
 		),
@@ -413,7 +432,7 @@ func RecordLockOperation(ctx context.Context, operation, database, status string
 
 // RecordSchedulerResume increments the scheduler resumed counter when an apply is
 // successfully claimed and resumed.
-func RecordSchedulerResume(ctx context.Context, database, environment, previousState string) {
+func RecordSchedulerResume(ctx context.Context, database, deployment, environment, previousState string) {
 	meter := otel.Meter(meterName)
 	counter, err := meter.Int64Counter("schemabot.scheduler.resumed_total",
 		otelmetric.WithDescription("Total number of applies resumed by the scheduler"),
@@ -426,6 +445,7 @@ func RecordSchedulerResume(ctx context.Context, database, environment, previousS
 	counter.Add(ctx, 1,
 		otelmetric.WithAttributes(
 			attribute.String("database", database),
+			DeploymentAttribute(deployment),
 			EnvironmentAttribute(environment),
 			attribute.String("previous_state", previousState),
 		),
@@ -433,7 +453,7 @@ func RecordSchedulerResume(ctx context.Context, database, environment, previousS
 }
 
 // RecordSchedulerResumeFailure increments the scheduler resume failure counter.
-func RecordSchedulerResumeFailure(ctx context.Context, database, environment, reason string) {
+func RecordSchedulerResumeFailure(ctx context.Context, database, deployment, environment, reason string) {
 	meter := otel.Meter(meterName)
 	counter, err := meter.Int64Counter("schemabot.scheduler.resume_failures_total",
 		otelmetric.WithDescription("Total number of scheduler resume attempts that failed"),
@@ -446,6 +466,7 @@ func RecordSchedulerResumeFailure(ctx context.Context, database, environment, re
 	counter.Add(ctx, 1,
 		otelmetric.WithAttributes(
 			attribute.String("database", database),
+			DeploymentAttribute(deployment),
 			EnvironmentAttribute(environment),
 			attribute.String("reason", reason),
 		),
@@ -480,7 +501,7 @@ func RecordSchedulerClaimFailure(ctx context.Context, reason string) {
 }
 
 // RecordSchedulerClaimDuration records how long it took to claim and resume an apply.
-func RecordSchedulerClaimDuration(ctx context.Context, duration time.Duration, database, environment, previousState string) {
+func RecordSchedulerClaimDuration(ctx context.Context, duration time.Duration, database, deployment, environment, previousState string) {
 	meter := otel.Meter(meterName)
 	hist, err := meter.Float64Histogram("schemabot.scheduler.claim_duration_seconds",
 		otelmetric.WithDescription("Duration of scheduler claim + resume operations"),
@@ -493,6 +514,7 @@ func RecordSchedulerClaimDuration(ctx context.Context, duration time.Duration, d
 	hist.Record(ctx, duration.Seconds(),
 		otelmetric.WithAttributes(
 			attribute.String("database", database),
+			DeploymentAttribute(deployment),
 			EnvironmentAttribute(environment),
 			attribute.String("previous_state", previousState),
 		),

@@ -2,8 +2,10 @@ package api
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"slices"
 	"strconv"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
+	gomysql "github.com/go-sql-driver/mysql"
 	"gopkg.in/yaml.v3"
 )
 
@@ -172,6 +175,36 @@ type StorageConfig struct {
 	// DSN is the MySQL connection string for SchemaBot's internal database.
 	// Can be a direct DSN or a reference (e.g., "env:MYSQL_DSN" to read from env var).
 	DSN string `yaml:"dsn"`
+
+	// DSNFrom builds the MySQL connection string from separate database config
+	// and password references. It is mutually exclusive with DSN.
+	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
+}
+
+// DSNFromConfig configures a MySQL DSN assembled from separate secret values.
+type DSNFromConfig struct {
+	// ConfigRef is a secret reference containing database connection metadata.
+	ConfigRef string `yaml:"config_ref"`
+
+	// ConfigPaths selects fields from the referenced config document. Paths are
+	// dot-separated YAML map keys and default to host, port, and database.
+	ConfigPaths DSNFromConfigPaths `yaml:"config_paths,omitempty"`
+
+	// Username is the database user to include in the generated DSN.
+	Username string `yaml:"username"`
+
+	// PasswordRef is a secret reference containing the database user's password.
+	PasswordRef string `yaml:"password_ref"`
+
+	// Params are appended as MySQL DSN query parameters.
+	Params map[string]string `yaml:"params,omitempty"`
+}
+
+// DSNFromConfigPaths configures where to find connection fields in ConfigRef.
+type DSNFromConfigPaths struct {
+	Host     string `yaml:"host,omitempty"`
+	Port     string `yaml:"port,omitempty"`
+	Database string `yaml:"database,omitempty"`
 }
 
 // DatabaseConfig holds configuration for a registered database.
@@ -245,6 +278,10 @@ type EnvironmentConfig struct {
 	// Can be a direct DSN or a reference to a secret (e.g., "env:MYSQL_DSN").
 	DSN string `yaml:"dsn"`
 
+	// DSNFrom builds the database connection string for local mode from separate
+	// database config and password references. It is mutually exclusive with DSN.
+	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
+
 	// Target is the opaque Tern-facing target identifier for gRPC mode.
 	Target string `yaml:"target,omitempty"`
 
@@ -270,6 +307,12 @@ type EnvironmentConfig struct {
 	// When set, registers a named TLS config with the Go MySQL driver.
 	// Omit for LocalScale (no TLS) or set for real PlanetScale (mTLS with CA bundle).
 	TLS *TLSConfig `yaml:"tls,omitempty"`
+}
+
+type externalDatabaseEndpoint struct {
+	Host     string `yaml:"host"`
+	Port     int    `yaml:"port"`
+	Database string `yaml:"database"`
 }
 
 // TLSConfig holds TLS certificate paths for MySQL connections to PlanetScale branches.
@@ -369,15 +412,18 @@ func (c *ServerConfig) Validate() error {
 			return fmt.Errorf("database %q has no environments configured", name)
 		}
 		for env, envConfig := range dbConfig.Environments {
-			hasDSN := envConfig.DSN != ""
+			hasDSN := envConfig.HasLocalDSN()
 			hasRemoteRouting := envConfig.Target != "" || envConfig.Deployment != ""
 			switch {
 			case hasDSN && hasRemoteRouting:
-				return fmt.Errorf("database %q environment %q cannot configure both dsn and target/deployment", name, env)
+				return fmt.Errorf("database %q environment %q cannot configure both local DSN and target/deployment", name, env)
 			case hasDSN:
+				if err := envConfig.validateLocalDSNConfig(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
+					return err
+				}
 				continue
 			case !hasRemoteRouting:
-				return fmt.Errorf("database %q environment %q missing dsn or target/deployment", name, env)
+				return fmt.Errorf("database %q environment %q missing local DSN or target/deployment", name, env)
 			case envConfig.Target == "":
 				return fmt.Errorf("database %q environment %q missing target", name, env)
 			case envConfig.Deployment == "":
@@ -409,6 +455,10 @@ func (c *ServerConfig) Validate() error {
 		}
 	}
 
+	if err := c.Storage.validateLocalDSNConfig("storage"); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -422,7 +472,7 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 			continue
 		}
 		for environment, envConfig := range dbConfig.Environments {
-			if envConfig.DSN == "" {
+			if !envConfig.HasLocalDSN() {
 				continue
 			}
 			if remoteEnvironments[environment] == "" {
@@ -489,7 +539,7 @@ func (c *ServerConfig) ResolveDatabaseTarget(database, environment string) (Reso
 		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q environment %q is not configured on this server", database, environment)
 	}
 
-	if envConfig.DSN != "" {
+	if envConfig.HasLocalDSN() {
 		return ResolvedDatabaseTarget{
 			DatabaseType: dbConfig.Type,
 			Deployment:   database,
@@ -601,8 +651,215 @@ func (c *ServerConfig) IsCheckRequired(name string) bool {
 }
 
 // StorageDSN returns the resolved storage DSN.
-// It handles special prefixes (env:, file:) to read from various sources.
+// It handles special prefixes (env:, file:) to read from various sources and
+// can build a DSN from separate config/password references.
 // Falls back to MYSQL_DSN environment variable if not configured.
 func (c *ServerConfig) StorageDSN() (string, error) {
+	if c.Storage.DSNFrom != nil {
+		return c.Storage.DSNFrom.Resolve()
+	}
 	return secrets.Resolve(c.Storage.DSN, "MYSQL_DSN")
+}
+
+func (c StorageConfig) validateLocalDSNConfig(context string) error {
+	if c.DSN != "" && c.DSNFrom != nil {
+		return fmt.Errorf("%s cannot configure both dsn and dsn_from", context)
+	}
+	if c.DSNFrom != nil {
+		return c.DSNFrom.Validate(context)
+	}
+	return nil
+}
+
+// HasLocalDSN returns true when the environment should use a local database connection.
+func (c EnvironmentConfig) HasLocalDSN() bool {
+	return c.DSN != "" || c.DSNFrom != nil
+}
+
+func (c EnvironmentConfig) validateLocalDSNConfig(context string) error {
+	if c.DSN != "" && c.DSNFrom != nil {
+		return fmt.Errorf("%s cannot configure both dsn and dsn_from", context)
+	}
+	if c.DSNFrom != nil {
+		return c.DSNFrom.Validate(context)
+	}
+	return nil
+}
+
+func (c EnvironmentConfig) ResolveDSN() (string, error) {
+	if c.DSNFrom != nil {
+		return c.DSNFrom.Resolve()
+	}
+	return secrets.Resolve(c.DSN, "")
+}
+
+func (c *DSNFromConfig) Validate(context string) error {
+	if c.ConfigRef == "" {
+		return fmt.Errorf("%s dsn_from missing config_ref", context)
+	}
+	paths := c.configPaths()
+	if paths.Host == "" {
+		return fmt.Errorf("%s dsn_from missing config_paths.host", context)
+	}
+	if paths.Database == "" {
+		return fmt.Errorf("%s dsn_from missing config_paths.database", context)
+	}
+	if c.Username == "" {
+		return fmt.Errorf("%s dsn_from missing username", context)
+	}
+	if c.PasswordRef == "" {
+		return fmt.Errorf("%s dsn_from missing password_ref", context)
+	}
+	return nil
+}
+
+func (c *DSNFromConfig) Resolve() (string, error) {
+	if err := c.Validate("database connection"); err != nil {
+		return "", err
+	}
+
+	configYAML, err := secrets.Resolve(c.ConfigRef, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve database config reference: %w", err)
+	}
+
+	var config any
+	if err := yaml.Unmarshal([]byte(configYAML), &config); err != nil {
+		return "", fmt.Errorf("parse database config: %w", err)
+	}
+
+	paths := c.configPaths()
+	host, err := stringAtPath(config, paths.Host)
+	if err != nil {
+		return "", fmt.Errorf("read database config host: %w", err)
+	}
+	database, err := stringAtPath(config, paths.Database)
+	if err != nil {
+		return "", fmt.Errorf("read database config database: %w", err)
+	}
+	port, err := optionalIntAtPath(config, paths.Port)
+	if err != nil {
+		return "", fmt.Errorf("read database config port: %w", err)
+	}
+	endpoint := externalDatabaseEndpoint{Host: host, Port: port, Database: database}
+	if err := endpoint.validate(); err != nil {
+		return "", err
+	}
+
+	password, err := secrets.Resolve(c.PasswordRef, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve database password reference: %w", err)
+	}
+
+	mysqlConfig := gomysql.NewConfig()
+	mysqlConfig.Net = "tcp"
+	mysqlConfig.Addr = endpoint.address()
+	mysqlConfig.User = c.Username
+	mysqlConfig.Passwd = password
+	mysqlConfig.DBName = endpoint.Database
+	mysqlConfig.Params = c.Params
+
+	return mysqlConfig.FormatDSN(), nil
+}
+
+func (c *DSNFromConfig) configPaths() DSNFromConfigPaths {
+	paths := c.ConfigPaths
+	if paths.Host == "" {
+		paths.Host = "host"
+	}
+	if paths.Port == "" {
+		paths.Port = "port"
+	}
+	if paths.Database == "" {
+		paths.Database = "database"
+	}
+	return paths
+}
+
+func stringAtPath(document any, path string) (string, error) {
+	value, err := valueAtPath(document, path)
+	if err != nil {
+		return "", err
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("path %q must contain a string", path)
+	}
+	return text, nil
+}
+
+func optionalIntAtPath(document any, path string) (int, error) {
+	if path == "" {
+		return 0, nil
+	}
+	value, err := valueAtPath(document, path)
+	if err != nil {
+		if errors.Is(err, errPathNotFound) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	switch v := value.(type) {
+	case int:
+		return v, nil
+	case int64:
+		return int(v), nil
+	case float64:
+		if v != float64(int(v)) {
+			return 0, fmt.Errorf("path %q must contain an integer", path)
+		}
+		return int(v), nil
+	case string:
+		if v == "" {
+			return 0, nil
+		}
+		port, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("path %q must contain an integer: %w", path, err)
+		}
+		return port, nil
+	default:
+		return 0, fmt.Errorf("path %q must contain an integer", path)
+	}
+}
+
+var errPathNotFound = errors.New("path not found")
+
+func valueAtPath(document any, path string) (any, error) {
+	current := document
+	for segment := range strings.SplitSeq(path, ".") {
+		if segment == "" {
+			return nil, fmt.Errorf("path %q contains an empty segment", path)
+		}
+		m, ok := current.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("path %q segment %q does not select a map", path, segment)
+		}
+		next, ok := m[segment]
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", errPathNotFound, path)
+		}
+		current = next
+	}
+	return current, nil
+}
+
+func (e externalDatabaseEndpoint) validate() error {
+	if e.Host == "" {
+		return fmt.Errorf("database config missing host")
+	}
+	if e.Database == "" {
+		return fmt.Errorf("database config missing database")
+	}
+	return nil
+}
+
+func (e externalDatabaseEndpoint) address() string {
+	if _, _, err := net.SplitHostPort(e.Host); err == nil {
+		return e.Host
+	}
+	if e.Port == 0 {
+		return net.JoinHostPort(e.Host, "3306")
+	}
+	return net.JoinHostPort(e.Host, strconv.Itoa(e.Port))
 }

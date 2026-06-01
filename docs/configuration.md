@@ -20,6 +20,68 @@ databases:
         dsn: "file:/run/secrets/prod-dsn"
 ```
 
+### Building DSNs from separate secrets
+
+If your deployment stores database connection metadata separately from passwords,
+use `dsn_from` instead of a raw `dsn`. `config_ref` and `password_ref` support
+the same secret reference formats as `dsn`, including `env:`, `file:`, and
+`secretsmanager:`.
+
+```yaml
+storage:
+  dsn_from:
+    config_ref: "file:/run/secrets/storage-config.yaml"
+    username: "schemabot_user"
+    password_ref: "file:/run/secrets/storage-password"
+    params:
+      parseTime: "true"
+
+databases:
+  mydb:
+    type: mysql
+    environments:
+      staging:
+        dsn_from:
+          config_ref: "file:/run/secrets/mydb-config.yaml"
+          username: "mydb_user"
+          password_ref: "file:/run/secrets/mydb-password"
+          config_paths:
+            host: databases.mydb.host
+            port: databases.mydb.port
+            database: databases.mydb.database
+```
+
+By default, the referenced database config is expected to contain top-level
+`host`, `port`, and `database` fields. `port` is optional and defaults to 3306
+when omitted.
+
+```yaml
+host: db.example.com
+port: 3307
+database: appdb
+```
+
+For other config shapes, set `config_paths` to the dot-separated YAML paths that
+contain the connection fields. SchemaBot does not assign meaning to path names;
+it only reads the configured values and builds one DSN.
+
+```yaml
+databases:
+  mydb:
+    host: db.example.com
+    port: 3307
+    database: appdb
+```
+
+With the `config_paths` example above, SchemaBot reads:
+
+- `databases.mydb.host` for the hostname
+- `databases.mydb.port` for the optional port
+- `databases.mydb.database` for the database name
+
+`dsn` and `dsn_from` are mutually exclusive for each storage or database
+environment entry.
+
 ## gRPC Mode
 
 SchemaBot delegates to remote services that implement the Tern proto. This is useful for distributed deployments where schema changes need to run in separate isolated environments.

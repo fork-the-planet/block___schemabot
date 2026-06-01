@@ -77,7 +77,8 @@ tern_deployments:
   secondary:
     staging: "tern-staging:9090"
 repos:
-  org/repo: {}
+  org/repo:
+    enable_checks: false
 `
 	err := os.WriteFile(configPath, []byte(content), 0644)
 	require.NoError(t, err, "write config file")
@@ -87,6 +88,7 @@ repos:
 
 	assert.Equal(t, 2, len(cfg.TernDeployments))
 	assert.Contains(t, cfg.Repos, "org/repo")
+	assert.False(t, cfg.AreChecksEnabled("org/repo"))
 }
 
 func TestLoadServerConfigFromFile_DSNFrom(t *testing.T) {
@@ -1332,6 +1334,57 @@ func TestServerConfig_IsRepoAllowed(t *testing.T) {
 		}
 		assert.True(t, cfg.IsRepoAllowed("myorg/payments-service"))
 		assert.False(t, cfg.IsRepoAllowed("myorg/other-repo"))
+	})
+}
+
+func TestServerConfig_AreChecksEnabled(t *testing.T) {
+	t.Run("nil config defaults to enabled", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.True(t, cfg.AreChecksEnabled("org/repo"))
+	})
+
+	t.Run("nil repos defaults to enabled", func(t *testing.T) {
+		cfg := ServerConfig{Repos: nil}
+		assert.True(t, cfg.AreChecksEnabled("org/repo"))
+	})
+
+	t.Run("listed repo without override defaults to enabled", func(t *testing.T) {
+		cfg := ServerConfig{
+			Repos: map[string]RepoConfig{
+				"org/repo": {},
+			},
+		}
+		assert.True(t, cfg.AreChecksEnabled("org/repo"))
+	})
+
+	t.Run("unlisted repo defaults to enabled", func(t *testing.T) {
+		enableChecks := false
+		cfg := ServerConfig{
+			Repos: map[string]RepoConfig{
+				"org/repo": {EnableChecks: &enableChecks},
+			},
+		}
+		assert.True(t, cfg.AreChecksEnabled("org/other-repo"))
+	})
+
+	t.Run("explicit false disables checks", func(t *testing.T) {
+		enableChecks := false
+		cfg := ServerConfig{
+			Repos: map[string]RepoConfig{
+				"org/repo": {EnableChecks: &enableChecks},
+			},
+		}
+		assert.False(t, cfg.AreChecksEnabled("org/repo"))
+	})
+
+	t.Run("explicit true enables checks", func(t *testing.T) {
+		enableChecks := true
+		cfg := ServerConfig{
+			Repos: map[string]RepoConfig{
+				"org/repo": {EnableChecks: &enableChecks},
+			},
+		}
+		assert.True(t, cfg.AreChecksEnabled("org/repo"))
 	})
 }
 

@@ -18,6 +18,7 @@ type Storage struct {
 	applyLogs       *applyLogStore
 	controlRequests *controlRequestStore
 	applyComments   *applyCommentStore
+	applyOperations *applyOperationStore
 	checks          *checkStore
 	settings        *settingsStore
 	vitessApplyData *vitessApplyDataStore
@@ -34,6 +35,7 @@ func New(db *sql.DB) *Storage {
 		applyLogs:       &applyLogStore{db: db},
 		controlRequests: &controlRequestStore{db: db},
 		applyComments:   &applyCommentStore{db: db},
+		applyOperations: &applyOperationStore{db: db},
 		checks:          &checkStore{db: db},
 		settings:        &settingsStore{db: db},
 		vitessApplyData: &vitessApplyDataStore{db: db},
@@ -73,6 +75,11 @@ func (s *Storage) ControlRequests() storage.ControlRequestStore {
 // ApplyComments returns the apply comment store.
 func (s *Storage) ApplyComments() storage.ApplyCommentStore {
 	return s.applyComments
+}
+
+// ApplyOperations returns the apply-operations store.
+func (s *Storage) ApplyOperations() storage.ApplyOperationStore {
+	return s.applyOperations
 }
 
 // Checks returns the check store.

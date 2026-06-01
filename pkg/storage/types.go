@@ -373,6 +373,57 @@ type Apply struct {
 	UpdatedAt time.Time
 }
 
+// ApplyOperation represents one child row in the apply_operations table:
+// the per-(deployment, target) slice of a multi-deployment apply, and the
+// unit of work the operator (claim loop) reconciles.
+//
+// In the multi-deployment data model, one applies row owns 1..N
+// apply_operations rows — one per target deployment. Each row carries its
+// own state machine (mirroring state.Apply, so cutover/stop/revert/triage
+// work per-row), its own lock identity, and its own progress; the operator
+// can act on each deployment independently while keeping `apply_id` as the
+// user-facing handle for the whole rollout. applies.state is derived from
+// the child rows' states via the existing state.DeriveApplyState().
+//
+// Pure storage primitive: no caller writes these rows yet — the apply-create
+// dual-write arrives in a subsequent PR in the multi-deployment apply
+// workstream.
+type ApplyOperation struct {
+	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
+	ID int64
+
+	// ApplyID points to applies.id. Unique together with Deployment.
+	ApplyID int64
+
+	// Deployment is the Tern deployment name this child row targets
+	// (e.g. "region-a", "payments-eu"). Drawn from the resolved
+	// environment-level deployments map in server config.
+	Deployment string
+
+	// Target is the Tern-facing target selected by server config at apply
+	// time for this deployment. Mirrors plans.target / applies.target
+	// semantics. Empty for legacy / single-deployment shapes.
+	Target string
+
+	// State is the per-deployment state machine value. See state.ApplyOperation.
+	State string
+
+	// ErrorMessage contains error details if state is failed.
+	ErrorMessage string
+
+	// StartedAt is when the scheduler claimed this child row and execution began.
+	StartedAt *time.Time
+
+	// CompletedAt is when this child row reached a terminal state.
+	CompletedAt *time.Time
+
+	// CreatedAt is when the child row was inserted (typically at apply create).
+	CreatedAt time.Time
+
+	// UpdatedAt is when the child row was last updated.
+	UpdatedAt time.Time
+}
+
 // ApplyOptions contains durable user and engine options for an apply.
 // Stored as JSON in the database for flexibility across engine types.
 type ApplyOptions struct {

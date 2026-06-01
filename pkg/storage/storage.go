@@ -29,6 +29,9 @@ type Storage interface {
 	// ApplyComments returns the apply comment store.
 	ApplyComments() ApplyCommentStore
 
+	// ApplyOperations returns the apply-operations store.
+	ApplyOperations() ApplyOperationStore
+
 	// Checks returns the check store.
 	Checks() CheckStore
 
@@ -310,6 +313,46 @@ type ApplyCommentStore interface {
 	IncrementEditCount(ctx context.Context, applyID int64, commentState string) error
 
 	// DeleteByApply removes all comment records for an apply.
+	DeleteByApply(ctx context.Context, applyID int64) error
+}
+
+// ApplyOperationStore manages per-(apply, deployment) child rows for
+// multi-deployment applies. One apply owns 1..N apply_operations rows.
+//
+// Pure storage primitive: no orchestration code reads or writes these rows
+// yet — the apply-create dual-write and the operator's per-row claim + lock
+// relocation arrive in subsequent PRs in the multi-deployment apply
+// workstream.
+type ApplyOperationStore interface {
+	// Insert stores a new apply_operations row and returns its ID.
+	// Fails with a uniqueness error if (apply_id, deployment) already exists.
+	Insert(ctx context.Context, ad *ApplyOperation) (int64, error)
+
+	// Get returns a child row by ID, or nil if not found.
+	Get(ctx context.Context, id int64) (*ApplyOperation, error)
+
+	// GetByApplyAndDeployment returns the child row for (apply_id, deployment),
+	// or nil if not found.
+	GetByApplyAndDeployment(ctx context.Context, applyID int64, deployment string) (*ApplyOperation, error)
+
+	// ListByApply returns all child rows for an apply, ordered by id ascending.
+	ListByApply(ctx context.Context, applyID int64) ([]*ApplyOperation, error)
+
+	// UpdateState transitions a child row to a new state. Updates the state
+	// column only; for transitions that should also stamp started_at or
+	// completed_at, use MarkStarted / MarkCompleted / MarkFailed instead.
+	UpdateState(ctx context.Context, id int64, newState string) error
+
+	// MarkStarted sets state=running and started_at on a child row.
+	MarkStarted(ctx context.Context, id int64) error
+
+	// MarkCompleted sets state=completed and completed_at on a child row.
+	MarkCompleted(ctx context.Context, id int64) error
+
+	// MarkFailed sets state=failed, error_message, and completed_at on a child row.
+	MarkFailed(ctx context.Context, id int64, errMsg string) error
+
+	// DeleteByApply removes all child rows for an apply (cleanup on apply delete).
 	DeleteByApply(ctx context.Context, applyID int64) error
 }
 

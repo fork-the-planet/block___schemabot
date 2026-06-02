@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -191,8 +192,8 @@ func (s *testControlRequestStore) RequestPending(_ context.Context, req *storage
 }
 
 func (s *testControlRequestStore) GetPending(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
-	for i := len(s.requests) - 1; i >= 0; i-- {
-		req := s.requests[i]
+	for _, v := range slices.Backward(s.requests) {
+		req := v
 		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {
 			return cloneTestControlRequest(req), nil
 		}

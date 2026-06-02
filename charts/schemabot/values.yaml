@@ -73,6 +73,29 @@ grpc:
 #         production: "tern-payments-b:9090"
 #       payments-c:
 #         production: "tern-payments-c:9090"
+#
+# Example (multi-App routing — PREVIEW):
+# NOTE: configs that set apps: are rejected at config load until the
+# webhook runtime is wired to dispatch by App. The shape below is the
+# intended one so chart authors can prepare values without surprises
+# when the hard-block lifts in the follow-up PR.
+#   config:
+#     storage:
+#       dsn: "env:MYSQL_DSN"
+#     apps:
+#       app-a:
+#         app-id: "env:APP_A_ID"
+#         private-key: "file:/secrets/app-a/private-key"
+#         webhook-secret: "file:/secrets/app-a/webhook-secret"
+#       app-b:
+#         app-id: "env:APP_B_ID"
+#         private-key: "file:/secrets/app-b/private-key"
+#         webhook-secret: "file:/secrets/app-b/webhook-secret"
+#     repos:
+#       org-a/repo-x:
+#         github_app: app-a
+#       org-b/repo-y:
+#         github_app: app-b
 # config is required — helm install will fail without it.
 config: null
 

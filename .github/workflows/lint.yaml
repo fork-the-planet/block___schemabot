@@ -10,8 +10,47 @@ on:
 permissions:
   contents: read
 jobs:
+  # See test.yaml for the rationale of this docs-only skip pattern.
+  changes:
+    name: "Detect changes"
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.out.outputs.code }}
+    steps:
+      - name: "Detect non-docs changes"
+        if: github.event_name == 'pull_request'
+        id: filter
+        continue-on-error: true
+        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # dorny/paths-filter@v3.0.3
+        with:
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+      - name: "Resolve code-change flag"
+        id: out
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FILTER_OUTCOME: ${{ steps.filter.outcome }}
+          FILTER_CODE: ${{ steps.filter.outputs.code }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          elif [ "$FILTER_OUTCOME" != "success" ]; then
+            echo "::warning::paths-filter failed; running CI instead of skipping"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=$FILTER_CODE" >> "$GITHUB_OUTPUT"
+          fi
+
   golangci:
     name: lint
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:

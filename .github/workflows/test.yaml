@@ -11,8 +11,49 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
+  # Detect whether the change touches anything other than *.md / docs/**.
+  # PRs that touch only docs skip the heavy jobs below; pushes (main/tags)
+  # always run. Fails open: if detection fails, treat as code change.
+  changes:
+    name: "Detect changes"
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.out.outputs.code }}
+    steps:
+      - name: "Detect non-docs changes"
+        if: github.event_name == 'pull_request'
+        id: filter
+        continue-on-error: true
+        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # dorny/paths-filter@v3.0.3
+        with:
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+      - name: "Resolve code-change flag"
+        id: out
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FILTER_OUTCOME: ${{ steps.filter.outcome }}
+          FILTER_CODE: ${{ steps.filter.outputs.code }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          elif [ "$FILTER_OUTCOME" != "success" ]; then
+            echo "::warning::paths-filter failed; running CI instead of skipping"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=$FILTER_CODE" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: "Build"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -47,6 +88,8 @@ jobs:
 
   unit:
     name: "Unit Tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -69,6 +112,8 @@ jobs:
 
   integration:
     name: "Integration Tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -111,7 +156,8 @@ jobs:
 
   localscale:
     name: "LocalScale Tests (${{ matrix.shard }})"
-    needs: [build, localscale-matrix]
+    needs: [changes, build, localscale-matrix]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -144,6 +190,8 @@ jobs:
 
   e2e-mysql:
     name: "E2E MySQL Tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -191,7 +239,8 @@ jobs:
 
   e2e-vitess:
     name: "E2E Vitess Tests (${{ matrix.shard }})"
-    needs: e2e-vitess-matrix
+    needs: [changes, e2e-vitess-matrix]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -223,6 +272,8 @@ jobs:
           docker compose -f deploy/e2e/docker-compose.yml logs --tail=300 schemabot localscale 2>/dev/null || true
   e2e-k8s:
     name: "E2E K8s Tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -271,24 +322,63 @@ jobs:
 
   # Rollup jobs that match the old required check names.
   # Remove these after updating branch protection to use the new job names.
+  #
+  # On docs-only PRs the upstream jobs are intentionally skipped via the
+  # `changes` job; the rollups treat that as success. On any other PR a
+  # skipped or failed upstream is treated as failure.
   e2e-rollup:
     name: "E2E Tests"
-    needs: [e2e-mysql, e2e-vitess]
+    needs: [changes, e2e-mysql, e2e-vitess]
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - run: |
-          if [ "${{ needs.e2e-mysql.result }}" != "success" ] || [ "${{ needs.e2e-vitess.result }}" != "success" ]; then
+      - shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          E2E_MYSQL_RESULT: ${{ needs.e2e-mysql.result }}
+          E2E_VITESS_RESULT: ${{ needs.e2e-vitess.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::changes job failed"
+            exit 1
+          fi
+          if [ "$CHANGES_CODE" != "true" ]; then
+            echo "Docs-only PR; E2E intentionally skipped."
+            exit 0
+          fi
+          if [ "$E2E_MYSQL_RESULT" != "success" ]; then
+            echo "::error::e2e-mysql result=$E2E_MYSQL_RESULT"
+            exit 1
+          fi
+          if [ "$E2E_VITESS_RESULT" != "success" ]; then
+            echo "::error::e2e-vitess result=$E2E_VITESS_RESULT"
             exit 1
           fi
 
   localscale-rollup:
     name: "LocalScale Tests"
-    needs: localscale
+    needs: [changes, localscale]
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - run: |
-          if [ "${{ needs.localscale.result }}" != "success" ]; then
+      - shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          LOCALSCALE_RESULT: ${{ needs.localscale.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::changes job failed"
+            exit 1
+          fi
+          if [ "$CHANGES_CODE" != "true" ]; then
+            echo "Docs-only PR; LocalScale intentionally skipped."
+            exit 0
+          fi
+          if [ "$LOCALSCALE_RESULT" != "success" ]; then
+            echo "::error::localscale result=$LOCALSCALE_RESULT"
             exit 1
           fi

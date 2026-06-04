@@ -158,6 +158,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 					PR:             apply.PullRequest,
 					InstallationID: apply.InstallationID,
 					ApplyID:        apply.ID,
+					ApplyLease:     apply.Lease(),
 					Logger:         logger,
 					OnTerminalHook: func(a *storage.Apply) {
 						updated, err := h.updateCheckRecordForApplyResult(context.Background(), apply.Repository, apply.PullRequest, a)

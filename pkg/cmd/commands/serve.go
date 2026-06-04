@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -297,6 +298,13 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 }
 
 func buildWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (webhookRuntime, error) {
+	if len(serverConfig.Apps) > 0 {
+		return buildMultiAppWebhookRuntime(serverConfig, svc, logger)
+	}
+	return buildSingleAppWebhookRuntime(serverConfig, svc, logger)
+}
+
+func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (webhookRuntime, error) {
 	if !serverConfig.GitHub.Configured() {
 		if serverConfig.GitHub.PrivateKey != "" {
 			logger.Warn("GitHub App config found but credentials not available yet — webhook endpoint disabled")
@@ -326,6 +334,75 @@ func buildWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logge
 	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger)
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger)
 	logger.Info("GitHub webhook endpoint registered", "app_id", appID)
+	return webhookRuntime{
+		handler:                         handler,
+		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
+	}, nil
+}
+
+// buildMultiAppWebhookRuntime constructs a webhook handler that dispatches
+// inbound deliveries across multiple GitHub Apps. App-ID resolution and
+// duplicate detection are delegated to ServerConfig.ResolveGitHubAppsByID
+// so app-id validation has a single source of truth; this function then
+// resolves the remaining per-App credentials (private key, webhook secret)
+// and assembles the dispatch tables and ClientSet. Any resolution error
+// fails startup so a misconfigured multi-App deployment never serves the
+// webhook endpoint.
+func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (webhookRuntime, error) {
+	appsByID, err := serverConfig.ResolveGitHubAppsByID()
+	if err != nil {
+		return webhookRuntime{}, fmt.Errorf("resolve GitHub Apps: %w", err)
+	}
+
+	clients := make(map[string]ghclient.GitHubClientFactory, len(appsByID))
+	secretsByApp := make(map[string][]byte, len(appsByID))
+	appByID := make(map[int64]string, len(appsByID))
+
+	// Iterate App names in sorted order so startup log output is
+	// deterministic across restarts.
+	type appEntry struct {
+		id   int64
+		name string
+		cfg  api.GitHubAppConfig
+	}
+	entries := make([]appEntry, 0, len(appsByID))
+	for id, app := range appsByID {
+		entries = append(entries, appEntry{id: id, name: app.Name, cfg: app.Config})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+
+	for _, e := range entries {
+		privateKey, err := e.cfg.ResolvePrivateKey()
+		if err != nil {
+			return webhookRuntime{}, fmt.Errorf("resolve private key for app %q: %w", e.name, err)
+		}
+		if privateKey == "" {
+			return webhookRuntime{}, fmt.Errorf("app %q private key resolved to empty value", e.name)
+		}
+
+		secret, err := e.cfg.ResolveWebhookSecret()
+		if err != nil {
+			return webhookRuntime{}, fmt.Errorf("resolve webhook secret for app %q: %w", e.name, err)
+		}
+		if secret == "" {
+			return webhookRuntime{}, fmt.Errorf("app %q webhook secret resolved to empty value", e.name)
+		}
+
+		clients[e.name] = ghclient.NewClient(e.id, []byte(privateKey), logger)
+		secretsByApp[e.name] = []byte(secret)
+		appByID[e.id] = e.name
+
+		logger.Info("registered GitHub App", "app_name", e.name, "app_id", e.id)
+	}
+
+	handler := webhook.NewHandlerWithDispatch(
+		svc,
+		ghclient.NewClientSet(clients),
+		secretsByApp,
+		appByID,
+		logger,
+	)
+	logger.Info("GitHub multi-App webhook endpoint registered", "apps", len(serverConfig.Apps))
 	return webhookRuntime{
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,

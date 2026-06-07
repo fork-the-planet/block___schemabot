@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -14,7 +15,7 @@ import (
 // are considered failing.
 func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var failing []templates.BlockingCheck
-	filterRequiredChecks := statusRollupContainsRequiredCheck(statuses, config)
+	filterRequiredChecks := statusesContainRequiredCheck(statuses, config)
 	for _, s := range statuses {
 		if s.IsSchemaBot {
 			continue
@@ -46,12 +47,36 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 		return false
 	}
 
-	statuses, err := client.GetPRCheckStatuses(ctx, repo, headSHA)
+	statuses, err := client.GetPRCheckStatuses(ctx, repo, headSHA, config.RequiredChecks)
 	if err != nil {
+		details := &templates.CheckStatusAccessDetails{
+			GitHubApp: h.githubAppDisplayNameForRepo(repo, client),
+		}
+		diagnostic := ghclient.CheckStatusAccessDiagnostic{}
+		diagnosticRan := checkStatusReadLooksPermissionDenied(err)
+		if diagnosticRan {
+			diagnostic = client.DiagnoseCheckStatusAccess(ctx, repo, headSHA)
+			details.MissingPermissions = diagnostic.MissingPermissions
+			details.ChecksReadable = diagnostic.ChecksReadable
+			details.CommitStatusesReadable = diagnostic.CommitStatusesReadable
+		}
 		h.logger.Error("failed to fetch PR check statuses, blocking apply",
-			"repo", repo, "pr", pr, "environment", environment, "error", err)
+			"repo", repo,
+			"pr", pr,
+			"environment", environment,
+			"head_sha", headSHA,
+			"installation_id", installationID,
+			"github_operation", "read_pr_check_statuses",
+			"github_app", details.GitHubApp,
+			"diagnostic_ran", diagnosticRan,
+			"checks_readable", diagnostic.ChecksReadable,
+			"commit_statuses_readable", diagnostic.CommitStatusesReadable,
+			"missing_permissions", diagnostic.MissingPermissions,
+			"checks_error", diagnostic.ChecksError,
+			"commit_statuses_error", diagnostic.CommitStatusesError,
+			"error", err)
 		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByCheckStatusError(environment, err))
+			templates.RenderApplyBlockedByCheckStatusError(environment, err, details))
 		return true
 	}
 
@@ -79,11 +104,29 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 	return false
 }
 
+func checkStatusReadLooksPermissionDenied(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Resource not accessible")
+}
+
+func (h *Handler) githubAppDisplayNameForRepo(repo string, client *ghclient.InstallationClient) string {
+	if client != nil {
+		if slug := client.AppSlug(); slug != "" {
+			return slug
+		}
+	}
+	if cfg := h.config(); cfg != nil {
+		if resolved, err := cfg.ResolveGitHubAppForRepo(repo); err == nil && resolved.Name != defaultAppName {
+			return resolved.Name
+		}
+	}
+	return ""
+}
+
 // filterInProgressNonSchemaBotChecks returns checks that are still running,
 // excluding SchemaBot's own checks.
 func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var inProgress []templates.BlockingCheck
-	filterRequiredChecks := statusRollupContainsRequiredCheck(statuses, config)
+	filterRequiredChecks := statusesContainRequiredCheck(statuses, config)
 	for _, s := range statuses {
 		if s.IsSchemaBot {
 			continue
@@ -102,7 +145,7 @@ func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 	return inProgress
 }
 
-func statusRollupContainsRequiredCheck(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) bool {
+func statusesContainRequiredCheck(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) bool {
 	if config == nil || len(config.RequiredChecks) == 0 {
 		return false
 	}

@@ -201,6 +201,51 @@ func TestRenderApplyStatusComment_WaitingForCutover(t *testing.T) {
 	assert.Contains(t, result, "schemabot cutover")
 }
 
+func TestRenderApplyStatusComment_Recovering(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Recovering,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", Status: state.Task.Completed},
+			{TableName: "users", Status: state.Task.Recovering},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "Recovering")
+	assert.Contains(t, result, "1 recovering")
+	assert.Contains(t, result, "Recovering state...")
+	assert.Contains(t, result, "Cutover will be available once recovery completes")
+	assert.NotContains(t, result, "schemabot cutover")
+}
+
+func TestRenderApplyStatusComment_RecoveringCopyingRows(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Recovering,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "users", Status: state.Task.Recovering, RowsCopied: 420, RowsTotal: 1000, PercentComplete: 42, ETASeconds: 120},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "Row copy in progress (42%)")
+	assert.Contains(t, result, "Rows: 420 / 1,000 · ETA: 2m")
+	assert.Contains(t, result, "Row copy is in progress (42%)")
+	assert.Contains(t, result, "progress returns to the normal row-copy view")
+	assert.Contains(t, result, "Recovering after restart")
+	assert.NotContains(t, result, "Cutover will be available once recovery completes")
+	assert.NotContains(t, result, "schemabot cutover")
+}
+
 func TestRenderApplyStatusComment_CuttingOver(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",

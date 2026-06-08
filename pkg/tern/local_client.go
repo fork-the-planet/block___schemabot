@@ -238,6 +238,25 @@ func (c *LocalClient) credentials() *engine.Credentials {
 	}
 }
 
+func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *storage.Apply) (bool, bool, error) {
+	if apply == nil {
+		return false, false, fmt.Errorf("apply is required for deferred cutover signal lookup")
+	}
+	eng := c.getEngine()
+	checker, ok := eng.(engine.DeferredCutoverSignalChecker)
+	if !ok {
+		return false, false, nil
+	}
+	exists, err := checker.DeferredCutoverSignalExists(ctx, &engine.DeferredCutoverSignalRequest{
+		Database:    apply.Database,
+		Credentials: c.credentials(),
+	})
+	if err != nil {
+		return false, true, fmt.Errorf("check deferred cutover signal for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
+	}
+	return exists, true, nil
+}
+
 // Health checks the service health.
 func (c *LocalClient) Health(ctx context.Context) error {
 	return c.storage.Ping(ctx)
@@ -672,6 +691,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		switch {
 		case t.State == state.Task.Running ||
 			t.State == state.Task.WaitingForCutover ||
+			t.State == state.Task.Recovering ||
 			t.State == state.Task.CuttingOver ||
 			t.State == state.Task.RevertWindow:
 			// Prefer actively running/waiting tasks
@@ -782,6 +802,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			// can stay ahead of a stale engine poll; apply state is derived after
 			// task rows are coherent.
 			if !state.IsTerminalTaskState(activeTask.State) {
+				oldTaskState := activeTask.State
 				activeTask.State = taskState
 				now := time.Now()
 				activeTask.UpdatedAt = now
@@ -793,6 +814,17 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				}
 				if err := c.storage.Tasks().Update(ctx, activeTask); err != nil {
 					c.logger.Warn("failed to update task state from progress poll", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "error", err)
+				}
+				if !state.IsState(oldTaskState, taskState) && !state.IsTerminalTaskState(taskState) {
+					if apply, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err != nil {
+						c.logger.Warn("failed to load apply after progress task state update", "apply_id", activeTask.ApplyID, "error", err)
+					} else if apply != nil && !state.IsTerminalApplyState(apply.State) {
+						apply.State = state.DeriveApplyState(taskStates(currentApplyTasks))
+						apply.UpdatedAt = now
+						if err := c.storage.Applies().Update(ctx, apply); err != nil {
+							c.logger.Warn("failed to update apply after progress task state update", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+						}
+					}
 				}
 			}
 
@@ -1071,6 +1103,22 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 		return engineTaskState
 	}
 
+	// Recovering is a temporary scheduler-owned wrapper while an engine reattaches
+	// after restart. Recovery starts only after storage had already reached
+	// waiting_for_cutover, so row-copy progress during reattach must not move
+	// storage backward to running. Row counters can still be displayed from live
+	// engine progress while the durable state stays cutover-blocking.
+	if isRecoveryState(storedTaskState) && recoveryCompleteWithEngineState(engineTaskState) {
+		return engineTaskState
+	}
+
+	// Vitess deferred deploy reports running during deploy-request setup, then
+	// waiting_for_deploy once the request is ready for an operator start. That is
+	// forward progress even though the generic rank order treats running as later.
+	if state.IsState(storedTaskState, state.Task.Running) && state.IsState(engineTaskState, state.Task.WaitingForDeploy) {
+		return engineTaskState
+	}
+
 	// Scheduler/control-owned states block stale active engine progress.
 	if blocksActiveEngineProgress(storedTaskState) {
 		return storedTaskState
@@ -1097,6 +1145,16 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 // the scheduler can mark a task failed_retryable before a retry claims it.
 func blocksActiveEngineProgress(taskState string) bool {
 	return state.IsState(taskState, state.Task.Stopped, state.Task.FailedRetryable)
+}
+
+func isRecoveryState(taskState string) bool {
+	return state.IsState(taskState, state.Task.Recovering)
+}
+
+func recoveryCompleteWithEngineState(taskState string) bool {
+	return state.IsState(taskState,
+		state.Task.WaitingForCutover,
+	)
 }
 
 // activeTaskProgressRank orders ordinary active task phases. Terminal states

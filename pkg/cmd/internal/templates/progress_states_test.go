@@ -30,6 +30,7 @@ func TestFormatProgressState_PlanetScalePhases(t *testing.T) {
 	assert.Contains(t, FormatProgressState(state.Apply.ValidatingDeployRequest), "Validating deploy request")
 	assert.Contains(t, FormatProgressState(state.Apply.Cancelled), "Cancelled")
 	assert.Contains(t, FormatProgressState(state.Apply.FailedRetryable), "Retrying")
+	assert.Contains(t, FormatProgressState(state.Apply.Recovering), "Recovering")
 }
 
 func TestWriteStatusListHasMoreFooter(t *testing.T) {
@@ -224,6 +225,21 @@ func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	}
 	output := FormatTableProgress(tp)
 	assert.Contains(t, output, "Cutting over...")
+
+	tp.Status = state.Apply.Recovering
+	tp.PercentComplete = 45
+	output = FormatTableProgress(tp)
+	assert.Contains(t, output, "Recovering state...")
+	assert.Contains(t, output, ui.ProgressBarRowCopy(45))
+	assert.NotContains(t, output, ui.ProgressBarRowCopy(100))
+
+	tp.RowsCopied = 420
+	tp.RowsTotal = 1000
+	tp.ETASeconds = 120
+	output = FormatTableProgress(tp)
+	assert.Contains(t, output, "Row copy in progress (45%)")
+	assert.Contains(t, output, "Rows: 420 / 1,000 · ETA: 2m")
+	assert.NotContains(t, output, "Recovering state...")
 }
 
 func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
@@ -257,6 +273,7 @@ func TestVSchemaStatusLabel(t *testing.T) {
 	assert.Equal(t, "Pending", vschemaStatusLabel(state.Apply.WaitingForDeploy))
 	assert.Contains(t, vschemaStatusLabel(state.Apply.Running), "Applying")
 	assert.Contains(t, vschemaStatusLabel(state.Apply.WaitingForCutover), "Applying")
+	assert.Contains(t, vschemaStatusLabel(state.Apply.Recovering), "Applying")
 	assert.Contains(t, vschemaStatusLabel(state.Apply.CuttingOver), "Applying")
 	assert.Contains(t, vschemaStatusLabel(state.Apply.Completed), "Applied")
 	assert.Contains(t, vschemaStatusLabel(state.Apply.Failed), "Failed")
@@ -290,6 +307,7 @@ func TestStateColorFunc_PlanetScalePhases(t *testing.T) {
 		state.Apply.ValidatingBranch,
 		state.Apply.CreatingDeployRequest,
 		state.Apply.ValidatingDeployRequest,
+		state.Apply.Recovering,
 		state.Apply.Cancelled,
 	} {
 		fn := stateColorFunc(s)

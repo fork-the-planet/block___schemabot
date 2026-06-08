@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // View implements tea.Model.
@@ -81,6 +82,8 @@ func (m WatchModel) progressView() string {
 		if m.cutoverTriggered {
 			b.WriteString(m.spinner.View() + "Cutover triggered, waiting for completion...\n")
 		}
+	case state.IsState(m.state, state.Apply.Recovering):
+		b.WriteString(m.spinner.View() + "Recovering state...\n")
 	case state.IsState(m.state, state.Apply.CuttingOver):
 		b.WriteString(m.spinner.View() + "Cutting over...\n")
 	case state.IsState(m.state, state.Apply.Completed):
@@ -214,6 +217,14 @@ func (m WatchModel) progressView() string {
 			}
 			b.WriteString("Watching for cutover... (ESC to detach)\n")
 		}
+	case state.IsState(m.state, state.Apply.Recovering):
+		b.WriteString("\n\n")
+		if pct, ok := recoveringCopyPercent(m.tables); ok {
+			fmt.Fprintf(&b, "SchemaBot is recovering after restart.\nRow copy is in progress (%d%%); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
+		} else {
+			b.WriteString("SchemaBot is recovering after restart.\n")
+			b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
+		}
 	case state.IsState(m.state, state.Apply.Running):
 		b.WriteString("\n\n")
 		if m.volumeMode {
@@ -250,6 +261,19 @@ func (m WatchModel) fetchErrorLine() string {
 		label = fmt.Sprintf("Error (attempt %d)", m.consecutiveErrors)
 	}
 	return errStyle.Render(label+": "+m.errorMsg) + "\n"
+}
+
+func recoveringCopyPercent(tables []tableProgress) (int, bool) {
+	percent := 100
+	found := false
+	for _, table := range tables {
+		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || table.RowsTotal <= 0 || table.Percent >= 100 {
+			continue
+		}
+		percent = min(percent, ui.ClampPercent(table.Percent))
+		found = true
+	}
+	return percent, found
 }
 
 // toTemplateTables converts TUI tableProgress slices to template TableProgress

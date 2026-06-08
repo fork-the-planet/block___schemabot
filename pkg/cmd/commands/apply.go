@@ -684,6 +684,8 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 				log.emit("msg", "Deploy request ready — waiting for deploy")
 			case state.IsState(curState, state.Apply.WaitingForCutover) && lastGlobalState != "":
 				log.emit("msg", "Waiting for cutover")
+			case state.IsState(curState, state.Apply.Recovering) && lastGlobalState != "":
+				log.emit("msg", "Recovering state")
 			case state.IsState(curState, state.Apply.CuttingOver):
 				log.emit("msg", "Cutting over")
 			case state.IsState(curState, state.Apply.RevertWindow):
@@ -819,6 +821,19 @@ func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, t
 		kvs := tableKVs("Waiting for cutover", tbl, ts)
 		kvs = appendShardSummary(kvs, tbl.Shards)
 		e.emit(kvs...)
+	case state.Apply.Recovering:
+		kvs := tableKVs(recoveringLogMessage(tbl), tbl, ts)
+		if tbl.RowsTotal > 0 && tbl.PercentComplete < 100 {
+			kvs = append(kvs,
+				"progress", fmt.Sprintf("%d%%", min(int(tbl.PercentComplete), 100)),
+				"rows", fmt.Sprintf("%s/%s", ui.FormatNumber(ui.ClampRows(tbl.RowsCopied, tbl.RowsTotal)), ui.FormatNumber(tbl.RowsTotal)),
+			)
+			if tbl.ETASeconds > 0 {
+				kvs = append(kvs, "eta", ui.FormatETA(tbl.ETASeconds))
+			}
+		}
+		kvs = appendShardSummary(kvs, tbl.Shards)
+		e.emit(kvs...)
 	case state.Apply.CuttingOver:
 		kvs := tableKVs("Cutting over", tbl, ts)
 		kvs = appendShardSummary(kvs, tbl.Shards)
@@ -835,6 +850,13 @@ func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, t
 		kvs = appendShardSummary(kvs, tbl.Shards)
 		e.emit(kvs...)
 	}
+}
+
+func recoveringLogMessage(tbl *apitypes.TableProgressResponse) string {
+	if tbl.RowsTotal > 0 && tbl.PercentComplete < 100 {
+		return "Row copy in progress during restart recovery"
+	}
+	return "Recovering state"
 }
 
 // emitProgressHeartbeat emits a progress line for a table actively copying rows.

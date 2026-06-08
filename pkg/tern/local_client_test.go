@@ -491,6 +491,55 @@ func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhenNotReady(t *tes
 	assert.Equal(t, storage.ControlRequestPending, pending.Status)
 }
 
+func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhileRecovering(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              129,
+		ApplyIdentifier: "apply-cutover-recovering-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Recovering,
+	}
+	task := &storage.Task{
+		ID:             462,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-recovering-local",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Recovering,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.Equal(t, 0, fakeEngine.cutoverCount)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	assert.Equal(t, storage.ControlRequestPending, pending.Status)
+}
+
 func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              126,
@@ -596,10 +645,11 @@ func TestTaskStateWithNoBackwardProgressPolicyCoversTaskStates(t *testing.T) {
 		_, hasProgressRank := activeTaskProgressRank(taskState)
 		hasPolicy := state.IsTerminalTaskState(taskState) ||
 			blocksActiveEngineProgress(taskState) ||
+			isRecoveryState(taskState) ||
 			hasProgressRank
 
 		assert.Truef(t, hasPolicy,
-			"task state %s=%q must be terminal, scheduler/control-owned, or ranked as active progress",
+			"task state %s=%q must be terminal, scheduler/control-owned, recovery-owned, or ranked as active progress",
 			taskName, taskState)
 	}
 }
@@ -754,6 +804,12 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 			expected:         state.Task.Running,
 		},
 		{
+			name:             "Vitess defer deploy can pause after deploy request validation",
+			storedTaskState:  state.Task.Running,
+			engineTableState: state.Task.WaitingForDeploy,
+			expected:         state.Task.WaitingForDeploy,
+		},
+		{
 			name:             "terminal engine state can advance active stored state",
 			storedTaskState:  state.Task.Running,
 			engineTableState: "complete",
@@ -777,6 +833,30 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 			engineTableState: state.Task.Running,
 			expected:         state.Task.FailedRetryable,
 		},
+		{
+			name:             "recovery preserves cutover-ready storage while engine reports row copy",
+			storedTaskState:  state.Task.Recovering,
+			engineTableState: state.Task.Running,
+			expected:         state.Task.Recovering,
+		},
+		{
+			name:             "recovery exits when engine proves cutover readiness",
+			storedTaskState:  state.Task.Recovering,
+			engineTableState: state.Task.WaitingForCutover,
+			expected:         state.Task.WaitingForCutover,
+		},
+		{
+			name:             "recovery ignores cutting over because cutover readiness was not re-established",
+			storedTaskState:  state.Task.Recovering,
+			engineTableState: state.Task.CuttingOver,
+			expected:         state.Task.Recovering,
+		},
+		{
+			name:             "recovery stays visible until engine proves cutover readiness",
+			storedTaskState:  state.Task.Recovering,
+			engineTableState: state.Task.Pending,
+			expected:         state.Task.Recovering,
+		},
 	}
 
 	for _, tc := range tests {
@@ -784,4 +864,11 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 			assert.Equal(t, tc.expected, progressTableStatus(tc.storedTaskState, tc.engineTableState))
 		})
 	}
+}
+
+func TestRecoveringProtoConversion(t *testing.T) {
+	assert.Equal(t, ternv1.State_STATE_RECOVERING, storageStateToProto(state.Apply.Recovering))
+	assert.Equal(t, ternv1.State_STATE_RECOVERING, storageStateToProto(state.Task.Recovering))
+	assert.Equal(t, ternv1.State_STATE_RECOVERING, storageStateToProto("recovering_cutover"))
+	assert.Equal(t, state.Apply.Recovering, ProtoStateToStorage(ternv1.State_STATE_RECOVERING))
 }

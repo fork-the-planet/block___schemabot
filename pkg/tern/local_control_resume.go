@@ -433,6 +433,41 @@ func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *s
 	}
 }
 
+func shouldInspectDeferredCutoverSignal(apply *storage.Apply) bool {
+	return apply != nil &&
+		apply.GetOptions().DeferCutover &&
+		state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.Recovering)
+}
+
+func (c *LocalClient) markApplyRecovering(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
+	c.logger.Info("entering recovery state for deferred cutover checkpoint",
+		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"database_type", apply.DatabaseType,
+		"task_count", len(tasks))
+	oldApplyState := apply.State
+	for _, task := range tasks {
+		if state.IsTerminalTaskState(task.State) {
+			c.logger.Debug("leaving terminal task unchanged during recovery",
+				"apply_id", apply.ApplyIdentifier,
+				"task_id", task.TaskIdentifier,
+				"task_state", task.State)
+			continue
+		}
+		c.transitionTaskState(ctx, task, apply.ID, state.Task.Recovering,
+			fmt.Sprintf("Task %s is recovering after restart", task.TaskIdentifier))
+	}
+	apply.State = state.Apply.Recovering
+	apply.CompletedAt = nil
+	apply.UpdatedAt = time.Now()
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return fmt.Errorf("mark apply %s recovering after restart: %w", apply.ApplyIdentifier, err)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+		"Recovering after restart before accepting cutover requests", oldApplyState, state.Apply.Recovering)
+	return nil
+}
+
 // launchAtomicResume sends all DDLs to the engine in one call, marks tasks and
 // apply as RUNNING, logs the provided message, and then polls for completion.
 // Scheduler-owned calls block so the worker owns the apply until terminal or
@@ -519,16 +554,24 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 
 	now := time.Now()
 	oldApplyState := apply.State
+	recovering := state.IsState(oldApplyState, state.Apply.Recovering)
 
 	for _, task := range tasks {
-		c.transitionTaskState(ctx, task, 0, state.Task.Running, "")
+		taskState := state.Task.Running
+		if recovering {
+			taskState = state.Task.Recovering
+		}
+		c.transitionTaskState(ctx, task, 0, taskState, "")
 	}
 
 	apply.State = state.Apply.Running
+	if recovering {
+		apply.State = state.Apply.Recovering
+	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
-		return fmt.Errorf("mark grouped resume apply %s running: %w", apply.ApplyIdentifier, err)
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+		return fmt.Errorf("mark grouped resume apply %s %s: %w", apply.ApplyIdentifier, apply.State, err)
 	}
 	if startRequested {
 		if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
@@ -537,7 +580,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	}
 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-		logMessage, oldApplyState, state.Apply.Running)
+		logMessage, oldApplyState, apply.State)
 
 	if block {
 		pollCtx, cancelPoll := context.WithCancel(ctx)
@@ -622,6 +665,46 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Recovering apply (heartbeat expired, was in %s state)", apply.State), "", "")
 
+	deferredCutoverSignalAbsent := false
+	if shouldInspectDeferredCutoverSignal(apply) {
+		signalExists, signalSupported, err := c.deferredCutoverSignalExists(ctx, apply)
+		if err != nil {
+			c.logger.Warn("deferred cutover recovery could not verify engine cutover signal; scheduler will retry",
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"database_type", apply.DatabaseType,
+				"error", err)
+			return fmt.Errorf("verify engine cutover signal before recovering deferred cutover apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		if signalSupported {
+			if signalExists {
+				if err := c.markApplyRecovering(ctx, apply, tasks); err != nil {
+					return err
+				}
+				options := buildApplyOptions(apply)
+				resumeCtx, cancelResume := context.WithCancel(ctx)
+				cancelGeneration := c.setApplyCancel(cancelResume)
+				defer c.clearApplyCancel(cancelGeneration)
+				defer cancelResume()
+				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering from checkpoint", true, false); err != nil {
+					return c.handleGroupedResumeFailure(ctx, apply, tasks, fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err), false)
+				}
+				return ctx.Err()
+			}
+			c.logger.Info("engine cutover signal is absent during deferred cutover recovery; re-plan will reconcile completed work",
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"database_type", apply.DatabaseType)
+			deferredCutoverSignalAbsent = true
+		} else {
+			c.logger.Info("engine does not support deferred cutover signal lookup; re-plan will reconcile deferred cutover recovery",
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"database_type", apply.DatabaseType,
+				"engine", c.getEngine().Name())
+		}
+	}
+
 	rp, err := c.replanAndFilterTasks(ctx, apply, tasks, plan)
 	if err != nil {
 		c.logger.Error("re-plan failed during recovery", "apply_id", apply.ApplyIdentifier, "error", err)
@@ -629,6 +712,19 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	}
 
 	activeTasks := rp.ActiveTasks
+	if deferredCutoverSignalAbsent && len(activeTasks) > 0 {
+		message := "deferred cutover signal is absent but live schema does not match desired schema; manual reconciliation required"
+		c.logger.Error("deferred cutover recovery cannot reconcile absent cutover signal",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"database_type", apply.DatabaseType,
+			"active_task_count", len(activeTasks))
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+			message, apply.State, state.Apply.Failed)
+		c.failApplyWithTasks(ctx, apply, activeTasks, message)
+		c.notifyTerminalObserver(apply, tasks)
+		return nil
+	}
 	startControlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
 		return err
@@ -665,26 +761,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		defer c.clearApplyCancel(cancelGeneration)
 		defer cancelResume()
 		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply)), true, startRequested); err != nil {
-			if c.shouldRetryEngineError(err) {
-				c.logger.Warn("engine apply failed during recovery, pausing apply for scheduler retry",
-					"apply_id", apply.ApplyIdentifier,
-					"error", err)
-				c.markApplyRetryableWithTasks(ctx, apply, activeTasks, err.Error())
-				return nil
-			}
-			c.logger.Error("engine apply failed during recovery",
-				"apply_id", apply.ApplyIdentifier,
-				"error", err)
-			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-				fmt.Sprintf("Recovery failed: %v", err), apply.State, state.Apply.Failed)
-			c.failApplyWithTasks(ctx, apply, activeTasks, err.Error())
-			if startRequested {
-				if failErr := failPendingStartControlRequests(ctx, c.storage, apply, err.Error()); failErr != nil {
-					return failErr
-				}
-			}
-			c.notifyTerminalObserver(apply, activeTasks)
-			return err
+			return c.handleGroupedResumeFailure(ctx, apply, activeTasks, err, startRequested)
 		}
 	} else {
 		// Sequential mode: process each task one at a time
@@ -712,6 +789,34 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	}
 
 	return ctx.Err()
+}
+
+func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error, startRequested bool) error {
+	if c.shouldRetryEngineError(err) {
+		c.logger.Warn("engine apply failed during recovery, pausing apply for scheduler retry",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"database_type", apply.DatabaseType,
+			"error", err)
+		c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
+		return nil
+	}
+
+	c.logger.Error("engine apply failed during recovery",
+		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"database_type", apply.DatabaseType,
+		"error", err)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Recovery failed: %v", err), apply.State, state.Apply.Failed)
+	c.failApplyWithTasks(ctx, apply, tasks, err.Error())
+	if startRequested {
+		if failErr := failPendingStartControlRequests(ctx, c.storage, apply, err.Error()); failErr != nil {
+			return failErr
+		}
+	}
+	c.notifyTerminalObserver(apply, tasks)
+	return err
 }
 
 func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) {

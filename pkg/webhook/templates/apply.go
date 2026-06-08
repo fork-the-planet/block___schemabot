@@ -85,6 +85,8 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("## Schema Change — Waiting for Deploy\n\n")
 	case state.Apply.WaitingForCutover:
 		sb.WriteString("## Schema Change — Waiting for Cutover\n\n")
+	case state.Apply.Recovering:
+		sb.WriteString("## Schema Change — Recovering\n\n")
 	case state.Apply.CuttingOver:
 		sb.WriteString("## Schema Change — Cutting Over\n\n")
 	case state.Apply.RevertWindow:
@@ -184,7 +186,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, queued, failed, stopped, waiting, cutting, cancelled int
+	var completed, running, queued, failed, stopped, waiting, recovering, cutting, cancelled int
 	var runningPct int
 
 	for _, t := range tables {
@@ -198,6 +200,8 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			queued++
 		case state.Task.WaitingForCutover:
 			waiting++
+		case state.Task.Recovering:
+			recovering++
 		case state.Task.CuttingOver:
 			cutting++
 		case state.Task.Failed:
@@ -235,6 +239,13 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			parts = append(parts, fmt.Sprintf("%d waiting for cutover", waiting))
 		} else {
 			parts = append(parts, "waiting for cutover")
+		}
+	}
+	if recovering > 0 {
+		if multi {
+			parts = append(parts, fmt.Sprintf("%d recovering", recovering))
+		} else {
+			parts = append(parts, "recovering")
 		}
 	}
 	if cutting > 0 {
@@ -314,6 +325,19 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 		}
 		writeDDLLine(sb, table.DDL)
 
+	case state.Task.Recovering:
+		if recoveringIsCopyingRows(table) {
+			pct := ui.ClampPercent(table.PercentComplete)
+			bar := ui.ProgressBarRowCopy(pct)
+			fmt.Fprintf(sb, "**`%s`**: %s Row copy in progress (%d%%)\n", table.TableName, bar, pct)
+			writeDDLLine(sb, table.DDL)
+			writeRowsAndETA(sb, table)
+			break
+		}
+		bar := ui.ProgressBarWaitingCutover()
+		fmt.Fprintf(sb, "**`%s`**: %s Recovering state...\n", table.TableName, bar)
+		writeDDLLine(sb, table.DDL)
+
 	case state.Task.CuttingOver:
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Cutting over...\n", table.TableName, bar)
@@ -357,6 +381,23 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 		fmt.Fprintf(sb, "**`%s`**: Running...\n", table.TableName)
 		writeDDLLine(sb, table.DDL)
 	}
+}
+
+func recoveringIsCopyingRows(table TableProgressData) bool {
+	return table.RowsTotal > 0 && table.PercentComplete < 100
+}
+
+func recoveringCopyPercent(tables []TableProgressData) (int, bool) {
+	percent := 100
+	found := false
+	for _, table := range tables {
+		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || !recoveringIsCopyingRows(table) {
+			continue
+		}
+		percent = min(percent, ui.ClampPercent(table.PercentComplete))
+		found = true
+	}
+	return percent, found
 }
 
 // renderStoppedTable renders a table in the stopped state.
@@ -416,6 +457,13 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeFooterAction(sb, "To deploy:", fmt.Sprintf("schemabot cutover %s", data.ApplyID))
 	case state.Apply.WaitingForCutover:
 		writeFooterAction(sb, "To proceed with cutover:", fmt.Sprintf("schemabot cutover %s", data.ApplyID))
+	case state.Apply.Recovering:
+		sb.WriteString("\n---\n\n")
+		if pct, ok := recoveringCopyPercent(data.Tables); ok {
+			fmt.Fprintf(sb, "Recovering after restart. Row copy is in progress (%d%%); once recovery completes, progress returns to the normal row-copy view.\n", pct)
+		} else {
+			sb.WriteString("Recovering after restart. Cutover will be available once recovery completes.\n")
+		}
 	case state.Apply.CuttingOver:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")

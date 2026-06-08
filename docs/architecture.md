@@ -230,6 +230,43 @@ process. The scheduler owner then sends the local engine request or remote gRPC
 the request fails or is rejected, the request is marked failed with the
 operator-visible reason so a later retry requires a new operator request.
 
+Restart recovery has a separate visible phase while SchemaBot reattaches to an
+engine after owner loss. If storage says a MySQL/Spirit apply was
+`waiting_for_cutover` and Spirit's `_spirit_sentinel` table still exists, the
+scheduler marks the apply `recovering` before cutover is safe again. Cutover
+requests are rejected in this phase. Once progress reports concrete engine work,
+SchemaBot returns the apply to the normal state for that work: `running` for row
+copy or `waiting_for_cutover` when Spirit has re-reached the sentinel wait. The
+sentinel is a narrow durable fallback until Spirit exposes an explicit resume
+outcome/status API; sentinel presence is enough to block cutover safely, but it
+does not prove Spirit reused prior row-copy progress.
+
+If the sentinel is already absent when SchemaBot restarts, recovery does not
+enter `recovering`. The scheduler re-plans against the live schema; if
+the desired schema is already present, the apply is marked completed, otherwise
+the remaining work is resumed through the normal checkpoint recovery path.
+
+```diagram
+╭─────────────────────╮   restart   ╭────────────╮
+│ waiting_for_cutover │────────────▶│ recovering │
+╰─────────────────────╯             ╰─────┬──────╯
+                                          │ engine reports row copy
+                                          ▼
+                                     ╭─────────╮
+                                     │ running │
+                                     ╰────┬────╯
+                                          │ engine reaches sentinel wait
+                                          ▼
+                                 ╭─────────────────────╮
+                                 │ waiting_for_cutover │
+                                 ╰──────────┬──────────╯
+                                            │ durable cutover request
+                                            ▼
+                                      ╭──────────────╮
+                                      │ cutting_over │
+                                      ╰──────────────╯
+```
+
 This preserves single-owner semantics for running applies: a fresh running apply
 with a pending stop request is still owned by its current worker, not claimed by
 a second scheduler worker. If that worker or process exits before acting, the

@@ -18,6 +18,7 @@ import (
 
 // taskStateToApplyState maps a task state string to an Apply state string.
 func taskStateToApplyState(ts string) string {
+	ts = state.NormalizeTaskStatus(ts)
 	switch ts {
 	case state.Task.Pending:
 		return state.Apply.Pending
@@ -27,6 +28,8 @@ func taskStateToApplyState(ts string) string {
 		return state.Apply.WaitingForDeploy
 	case state.Task.WaitingForCutover:
 		return state.Apply.WaitingForCutover
+	case state.Task.Recovering:
+		return state.Apply.Recovering
 	case state.Task.CuttingOver:
 		return state.Apply.CuttingOver
 	case state.Task.RevertWindow:
@@ -46,6 +49,14 @@ func taskStateToApplyState(ts string) string {
 	default:
 		return state.Apply.Pending
 	}
+}
+
+func taskStates(tasks []*storage.Task) []string {
+	states := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		states = append(states, task.State)
+	}
+	return states
 }
 
 // engineStateToStorage converts engine State to a canonical task state string.
@@ -103,6 +114,7 @@ func progressFailureMessage(result *engine.ProgressResult) string {
 
 // storageStateToProto converts a task state string to proto State enum.
 func storageStateToProto(ts string) ternv1.State {
+	ts = state.NormalizeState(ts)
 	switch ts {
 	case state.Task.Pending:
 		return ternv1.State_STATE_PENDING
@@ -112,6 +124,8 @@ func storageStateToProto(ts string) ternv1.State {
 		return ternv1.State_STATE_WAITING_FOR_DEPLOY
 	case state.Task.WaitingForCutover:
 		return ternv1.State_STATE_WAITING_FOR_CUTOVER
+	case state.Task.Recovering, state.Apply.Recovering:
+		return ternv1.State_STATE_RECOVERING
 	case state.Task.CuttingOver:
 		return ternv1.State_STATE_CUTTING_OVER
 	case state.Task.RevertWindow:
@@ -199,6 +213,8 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.WaitingForDeploy
 	case ternv1.State_STATE_WAITING_FOR_CUTOVER:
 		return state.Apply.WaitingForCutover
+	case ternv1.State_STATE_RECOVERING:
+		return state.Apply.Recovering
 	case ternv1.State_STATE_CUTTING_OVER:
 		return state.Apply.CuttingOver
 	case ternv1.State_STATE_REVERT_WINDOW:

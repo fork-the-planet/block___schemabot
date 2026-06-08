@@ -229,6 +229,125 @@ another control request. This case is only idempotent when SchemaBot storage is
 already `cutting_over`; remote-only `cutting_over` with stale stored state
 follows the remote-readiness scenario above.
 
+### Deferred-cutover restart recovery state DAG
+
+The recovery path starts only after durable storage had already reached
+`waiting_for_cutover`. That stored cutover-ready fact is authoritative: recovery
+must not move durable storage backward to `running` just because Spirit reports
+row-copy progress after reattaching. Row-copy counters can be displayed while the
+apply remains `recovering`, but durable storage exits recovery only when cutover
+readiness is proven again or live-schema reconciliation proves completion.
+
+```diagram
+╭────────────────────────────────────╮
+│ storage: waiting_for_cutover        │
+│ old owner stopped heartbeating      │
+╰──────────────────┬─────────────────╯
+                   ▼
+        ╭──────────────────────╮
+        │ check Spirit sentinel │
+        ╰──────────┬───────────╯
+                   │
+      ┌────────────┴────────────┐
+      ▼                         ▼
+╭───────────────╮        ╭──────────────────────╮
+│ sentinel      │        │ sentinel absent      │
+│ still exists  │        │ re-plan live schema  │
+╰───────┬───────╯        ╰──────────┬───────────╯
+        ▼                           ▼
+╭────────────────────────╮   ╭────────────────────────╮
+│ storage: recovering    │   │ storage: completed if   │
+│ cutover remains blocked│   │ desired schema matches; │
+╰───────────┬────────────╯   │ otherwise fail closed   │
+            │                ╰────────────────────────╯
+            │ Spirit reports row copy
+            ▼
+╭────────────────────────╮
+│ stay recovering        │
+│ display row-copy detail│
+╰───────────┬────────────╯
+            │ Spirit reports waiting_for_cutover
+            ▼
+╭────────────────────────╮
+│ storage:               │
+│ waiting_for_cutover    │
+│ cutover can be requested │
+╰────────────────────────╯
+```
+
+### Start state: storage is `waiting_for_cutover`; Spirit sentinel still exists after restart
+
+SchemaBot has already stored the apply as cutover-ready, but the old owner died
+before cutover was safely completed. On restart, the new scheduler owner must
+prove the engine state before accepting cutover. A present Spirit sentinel means
+cutover has not been signaled yet, so SchemaBot enters temporary recovery.
+
+While recovery is unresolved, fresh `/cutover` requests are rejected visibly and
+no new durable cutover request is queued. If Spirit reattaches and reports row
+copy, SchemaBot keeps storage in `recovering` and displays the row-copy detail
+without making the apply eligible for cutover. If Spirit reports
+`waiting_for_cutover`, SchemaBot returns storage to `waiting_for_cutover`, and a
+fresh operator cutover request can proceed.
+
+Recovery must not silently accept cutover before Spirit has reattached to the
+sentinel wait.
+
+### Start state: durable cutover request already exists before recovery starts
+
+This is different from a fresh `/cutover` request during recovery. The user has
+already been told the cutover request was accepted, so SchemaBot must preserve
+that durable intent and let the scheduler owner wait through normal progress
+until the apply reaches a safe cutover-ready state.
+
+If the owner dies after storing the request but before sending cutover, the next
+owner may still need to recover Spirit first. The request stays pending during
+`recovering` and during any resumed row copy. It is sent only after storage
+returns to `waiting_for_cutover`.
+
+The original cutover request is either completed after cutover is accepted, or
+failed with a visible error if the later Cutover RPC fails. It must not be failed
+merely because recovery or row copy is in progress, and it must not be sent while
+the engine has not yet reached `waiting_for_cutover`.
+
+### Start state: storage is `waiting_for_cutover`; Spirit sentinel is absent after restart
+
+SchemaBot has already stored the apply as cutover-ready, but the old owner died.
+On restart, the new scheduler owner finds no sentinel. That means cutover may
+already have been signaled manually or by another recovered owner, so SchemaBot
+must reconcile from live schema instead of staying in recovery.
+
+SchemaBot re-plans against the live schema. If the desired schema is already
+present, the apply and tasks are marked `completed`. If work remains, SchemaBot
+fails closed because the absent cutover signal no longer agrees with the durable
+cutover-ready state.
+
+SchemaBot reconciles from live schema instead of entering `recovering` forever.
+If an operator manually dropped the sentinel while SchemaBot was down and the
+data plane finished cutover, storage converges to `completed`.
+
+### Recovery UI states
+
+`recovering` is a temporary control-plane wrapper state, not the steady state of
+the underlying engine work. Current MySQL/Spirit deferred-cutover recovery uses
+it when storage already believed an apply had reached cutover readiness and
+restart recovery must prove the engine state before cutover can be requested
+again. Row-copy progress can be displayed during recovery, but SchemaBot returns
+the apply to the normal cutover-ready state only when cutover is safe again.
+
+| Stored state at restart | Recovery signal | What users see next |
+| --- | --- | --- |
+| `running` | Any sentinel state | Normal row-copy UI. SchemaBot does not enter `recovering` because storage had not reached cutover readiness. |
+| `waiting_for_cutover` | Sentinel still exists and Spirit has not reported progress yet | Temporary recovery UI. Cutover is blocked until SchemaBot proves the engine state. |
+| `recovering` | Spirit reports row-copy progress | Recovery UI with row-copy detail, such as `Row copy in progress (42%)`. Durable storage stays `recovering` and cutover remains blocked. |
+| `recovering` | Spirit reports `waiting_for_cutover` | Normal cutover-ready UI. A new cutover request can be accepted, or an already-pending durable cutover request can proceed. |
+| `waiting_for_cutover` | Sentinel is absent and live schema already matches desired schema | Completed UI after live-schema reconciliation. |
+| `waiting_for_cutover` | Sentinel is absent but work remains | Failed UI with a manual-reconciliation error. SchemaBot must not resume work after losing the cutover signal. |
+| `recovering` | Spirit never reports progress or an error | Recovery UI remains visible; SchemaBot must not synthesize cutover readiness. |
+
+Fresh cutover requests during recovery are rejected visibly. Durable cutover
+requests that were already accepted before recovery remain pending and are sent
+only after storage returns to `waiting_for_cutover`.
+
 ## Edge-case checklist
 
 | # | Scenario | Expected behavior | Status |
@@ -253,7 +372,10 @@ follows the remote-readiness scenario above.
 | 18 | MySQL/Spirit cutover RPC lands on a non-owner data-plane replica | After durable readiness checks, any replica can drop the sentinel table; the owner runner observes the DB-side signal | Covered by K8s e2e |
 | 19 | PR comment stop support | Same semantics as CLI stop: durable request first, caller visible, stop priority preserved | Covered |
 | 20 | PR comment cutover support | Same safety gate as CLI/API cutover, including pending-stop rejection, plus durable cutover intent if async ownership requires it | Covered |
-| 21 | Spirit checkpoint resume loses prior copy progress after restart | Surface lost-progress reason through Spirit resume status APIs instead of inferring from sentinel tables | Follow-up after Spirit dependency exposes the API |
+| 21 | Spirit checkpoint resume loses prior copy progress after restart | Keep cutover blocked because the sentinel is present; display row-copy detail while durable storage remains `recovering` until cutover readiness is proven again | Covered for current UX; typed lost-progress reason remains a follow-up after Spirit dependency exposes the API |
+| 22 | Fresh cutover request during deferred-cutover recovery with Spirit sentinel still present | Enter `recovering`, reject cutover while row-copy detail is still being reported; allow a new durable cutover request only after `waiting_for_cutover` | Covered by integration test |
+| 23 | Durable cutover request already pending when deferred-cutover recovery starts | Keep the request pending through recovery and running row copy; send Cutover only after storage reaches `waiting_for_cutover` | Covered by unit tests |
+| 24 | Deferred-cutover recovery with Spirit sentinel absent | Re-plan against live schema; mark completed if desired schema is present, otherwise fail closed for manual reconciliation | Covered by integration tests |
 
 ## Review questions for new gRPC control changes
 

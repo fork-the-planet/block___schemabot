@@ -197,6 +197,52 @@ func TestWatchModel_StoppedWithErrorShowsReason(t *testing.T) {
 	assert.Contains(t, view, "schemabot start")
 }
 
+func TestWatchModel_RecoveringShowsBlockedCutoverMessage(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", true)
+	m.applyID = "apply-recovering-cutover"
+
+	updated, _ := m.Update(progressMsg{
+		state: state.Apply.Recovering,
+		tables: []tableProgress{{
+			Name:    "users",
+			Status:  state.Task.Recovering,
+			Percent: 100,
+		}},
+	})
+	model := updated.(WatchModel)
+
+	view := model.View()
+	assert.Contains(t, view, "Recovering state")
+	assert.Contains(t, view, "Cutover will be available once recovery completes")
+	assert.NotContains(t, view, "Press Enter to proceed with cutover")
+}
+
+func TestWatchModel_RecoveringShowsCopyingRows(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", true)
+	m.applyID = "apply-recovering-cutover"
+
+	updated, _ := m.Update(progressMsg{
+		state: state.Apply.Recovering,
+		tables: []tableProgress{{
+			Name:       "users",
+			Status:     state.Task.Recovering,
+			RowsCopied: 420,
+			RowsTotal:  1000,
+			Percent:    42,
+		}},
+	})
+	model := updated.(WatchModel)
+
+	view := model.View()
+	assert.Contains(t, view, "Row copy in progress (42%)")
+	assert.Contains(t, view, "Rows: 420 / 1,000")
+	assert.Contains(t, view, "Row copy is in progress (42%)")
+	assert.Contains(t, view, "progress returns to the normal row-copy view")
+	assert.Contains(t, view, "SchemaBot is recovering after restart")
+	assert.NotContains(t, view, "Cutover will be available once recovery completes")
+	assert.NotContains(t, view, "Press Enter to proceed with cutover")
+}
+
 func TestWatchModel_ConnectionError_CanEscape(t *testing.T) {
 	// User should be able to ESC out of the loading+error state.
 	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)

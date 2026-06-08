@@ -24,6 +24,7 @@ the stored task rows.
 | ValidatingDeployRequest | `validating_deploy_request` | PlanetScale is validating the deploy request diff (PlanetScale only) |
 | WaitingForDeploy | `waiting_for_deploy` | Deploy request ready, waiting for user to trigger deploy (PlanetScale only). Without `--defer-deploy`, auto-advances immediately. |
 | WaitingForCutover | `waiting_for_cutover` | All tasks ready, waiting for manual cutover (atomic mode only — in sequential mode each task cuts over independently) |
+| Recovering | `recovering` | Restart recovery is reattaching to engine state. Control actions that require a later phase are blocked until the engine proves that phase is safe again. |
 | CuttingOver | `cutting_over` | Cutover in progress (atomic mode only) |
 | Completed | `completed` | All tasks finished successfully |
 | Failed | `failed` | At least one task failed |
@@ -53,6 +54,10 @@ stateDiagram-v2
     failed_retryable --> running : scheduler retry
     failed_retryable --> failed : retry budget or recovery window exhausted
 
+    waiting_for_cutover --> recovering : restart before cutover
+    recovering --> waiting_for_cutover : cutover readiness proven again
+    recovering --> completed : live schema reconciled
+    recovering --> failed : recovery failed
     waiting_for_cutover --> cutting_over
     cutting_over --> completed
 
@@ -62,6 +67,7 @@ stateDiagram-v2
 
 - `waiting_for_deploy`: PlanetScale only. The deploy request is created and ready, but not yet executed. With `--defer-deploy`, the user reviews the deploy request diff on PlanetScale and triggers via `schemabot cutover`. Without `--defer-deploy`, the system auto-advances through this state. For instant DDL, the deploy completes immediately after triggering. `--defer-deploy` and `--defer-cutover` compose: the first pauses before deploy, the second pauses before cutover.
 - `waiting_for_cutover`/`cutting_over`: Only with `--defer-cutover` or atomic mode (Spirit). Note: `--defer-cutover` is a no-op for instant DDL (no cutover exists).
+- `recovering`: Temporary restart recovery. Current MySQL/Spirit deferred-cutover recovery enters this state only after durable storage had already reached `waiting_for_cutover`. That stored cutover-ready state is authoritative: recovery must not move durable storage backward to `running` if Spirit reports row-copy progress after reattaching. Row-copy counters can still be displayed while storage remains `recovering`. Recovery exits to `waiting_for_cutover` only after cutover readiness is proven again, or to `completed` when live-schema reconciliation proves the data plane already reached the desired schema. Control operations that require a later phase are blocked while recovery is active.
 - `revert_window`: Only with `--enable-revert`. Spirit auto-advances through it; PlanetScale holds until expiry or user action. Maps from PlanetScale's `complete_pending_revert` deploy state
 - `stopped`: Spirit only — resumable via `schemabot start`. Spirit checkpoints progress for resume.
 - `failed_retryable`: transient engine failure. Scheduler workers retry while the retry budget remains, then move the apply to `failed`.
@@ -77,6 +83,7 @@ Per-table execution state. Mostly mirrors Apply state, with per-table scheduler/
 | Running | `running` | Engine is actively executing (row copy, checksum, etc.) |
 | WaitingForDeploy | `waiting_for_deploy` | Deploy request ready, waiting for user to trigger deploy (PlanetScale only) |
 | WaitingForCutover | `waiting_for_cutover` | Row copy complete, waiting for cutover signal |
+| Recovering | `recovering` | Engine is reattaching to state after restart |
 | CuttingOver | `cutting_over` | Table cutover in progress |
 | Completed | `completed` | Schema change applied successfully |
 | Failed | `failed` | Engine reported failure |
@@ -140,12 +147,13 @@ Next dispatch:
 4. Any task **stopped** → apply `stopped`
 5. Any task **reverted** → apply `reverted`
 6. All tasks **completed** → apply `completed`
-7. Any task **cutting_over** → apply `cutting_over`
-8. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
-9. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
-10. Any task **revert_window** → apply `revert_window`
-11. Any task **running** → apply `running`
-12. Otherwise → apply `pending`
+7. Any task **recovering** → apply `recovering`
+8. Any task **cutting_over** → apply `cutting_over`
+9. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
+10. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
+11. Any task **revert_window** → apply `revert_window`
+12. Any task **running** → apply `running`
+13. Otherwise → apply `pending`
 
 Apply terminal states (`completed`, `failed`, `stopped`, `cancelled`, `reverted`) are checked via `IsTerminalApplyState()`. Note: `failed_retryable` is not terminal because scheduler recovery can retry it, and `stopped` is not terminal at the task level because a stopped task can be resumed via Start.
 

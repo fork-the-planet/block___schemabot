@@ -3,15 +3,18 @@ package planetscale
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/schemabot/pkg/engine"
 )
 
+var _ engine.ControlResumeValidator = (*Engine)(nil)
+
 // Stop cancels the deploy request. This is permanent.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	meta, err := e.controlMeta(req)
+	meta, err := controlMeta(engine.ControlStop, req)
 	if err != nil {
 		return nil, fmt.Errorf("decode control metadata: %w", err)
 	}
@@ -39,7 +42,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 
 // Start starts a deferred deploy request. Cancelled deploy requests cannot be restarted.
 func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	meta, err := e.controlMeta(req)
+	meta, err := controlMeta(engine.ControlStart, req)
 	if err != nil {
 		return nil, fmt.Errorf("decode control metadata: %w", err)
 	}
@@ -75,7 +78,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 
 // Cutover triggers the final schema swap via ApplyDeployRequest.
 func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	meta, err := e.controlMeta(req)
+	meta, err := controlMeta(engine.ControlCutover, req)
 	if err != nil {
 		return nil, fmt.Errorf("decode control metadata: %w", err)
 	}
@@ -103,7 +106,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 
 // Revert rolls back a completed schema change during the revert window.
 func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	meta, err := e.controlMeta(req)
+	meta, err := controlMeta(engine.ControlRevert, req)
 	if err != nil {
 		return nil, fmt.Errorf("decode control metadata: %w", err)
 	}
@@ -131,7 +134,7 @@ func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engin
 
 // SkipRevert closes the revert window, making the schema change permanent.
 func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	meta, err := e.controlMeta(req)
+	meta, err := controlMeta(engine.ControlSkipRevert, req)
 	if err != nil {
 		return nil, fmt.Errorf("decode control metadata: %w", err)
 	}
@@ -158,7 +161,7 @@ func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*e
 }
 
 // controlMeta extracts and validates psMetadata from a control request.
-func (e *Engine) controlMeta(req *engine.ControlRequest) (*psMetadata, error) {
+func controlMeta(operation engine.ControlOperation, req *engine.ControlRequest) (*psMetadata, error) {
 	if req.ResumeState == nil || req.ResumeState.Metadata == "" {
 		return nil, fmt.Errorf("no active schema change")
 	}
@@ -166,8 +169,50 @@ func (e *Engine) controlMeta(req *engine.ControlRequest) (*psMetadata, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode resume state: %w", err)
 	}
-	if meta.DeployRequestID == 0 {
-		return nil, fmt.Errorf("no active schema change")
+	if err := validateControlMetadata(operation, meta); err != nil {
+		return nil, err
 	}
 	return meta, nil
+}
+
+// ValidateControlResumeState checks that the opaque PlanetScale resume state can
+// address the deploy request targeted by a control operation.
+func (e *Engine) ValidateControlResumeState(operation engine.ControlOperation, resumeState *engine.ResumeState) error {
+	return validateControlResumeState(operation, resumeState)
+}
+
+func validateControlResumeState(operation engine.ControlOperation, resumeState *engine.ResumeState) error {
+	if resumeState == nil || resumeState.Metadata == "" {
+		return fmt.Errorf("no active schema change")
+	}
+	meta, err := decodePSMetadata(resumeState.Metadata)
+	if err != nil {
+		return fmt.Errorf("decode resume state: %w", err)
+	}
+	return validateControlMetadata(operation, meta)
+}
+
+func validateControlMetadata(operation engine.ControlOperation, meta *psMetadata) error {
+	if missing := missingControlMetadata(meta); len(missing) > 0 {
+		prefix := "deploy request metadata is incomplete"
+		if operation != "" {
+			prefix = fmt.Sprintf("%s control resume state is incomplete", operation)
+		}
+		return fmt.Errorf("%s (missing %s)", prefix, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func missingControlMetadata(meta *psMetadata) []string {
+	var missing []string
+	if meta.BranchName == "" {
+		missing = append(missing, "branch_name")
+	}
+	if meta.DeployRequestID == 0 {
+		missing = append(missing, "deploy_request_id")
+	}
+	if meta.DeployRequestURL == "" {
+		missing = append(missing, "deploy_request_url")
+	}
+	return missing
 }

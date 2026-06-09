@@ -404,7 +404,7 @@ func TestE2EUnlockForceInfersDatabaseForCLILock(t *testing.T) {
 		}})
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
-		content := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n", dbName)
+		content := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"type":     "file",
 			"encoding": "base64",
@@ -1122,6 +1122,7 @@ func TestE2EApplyStaleLockReacquire(t *testing.T) {
 func TestE2EApplyProductionBlockedByStagingFirst(t *testing.T) {
 	dbName := "webhook_staging_first"
 	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "production")
 
 	// Seed a staging check that is NOT success (action_required — unapplied changes)
 	seedCheck(t, svc, dbName, "staging", "action_required")
@@ -1133,9 +1134,9 @@ func TestE2EApplyProductionBlockedByStagingFirst(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	// Client config can enable environments, but cannot control promotion order.
-	// Production listed before staging must still be gated by staging.
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - production\n  - staging\n", dbName)
+	// Server config owns both environment availability and promotion order.
+	// Production must be gated by staging.
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
@@ -1166,11 +1167,12 @@ func TestE2EApplyProductionBlockedByStagingFirst(t *testing.T) {
 }
 
 // TestE2EApplyUsesCustomServerEnvironmentOrder verifies that environment_order
-// in server config controls promotion order. The repo lists staging before
-// production, but this server config makes production the prior environment.
+// in server config controls promotion order. This server config makes
+// production the prior environment.
 func TestE2EApplyUsesCustomServerEnvironmentOrder(t *testing.T) {
 	dbName := "webhook_custom_env_order"
 	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "production")
 	svc.Config().EnvironmentOrder = []string{"production", "staging"}
 
 	seedCheck(t, svc, dbName, "production", "action_required")
@@ -1182,7 +1184,7 @@ func TestE2EApplyUsesCustomServerEnvironmentOrder(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n  - production\n", dbName)
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
@@ -1215,6 +1217,7 @@ func TestE2EApplyUsesCustomServerEnvironmentOrder(t *testing.T) {
 func TestE2EApplyProductionAllowedWhenStagingSuccess(t *testing.T) {
 	dbName := "webhook_staging_ok"
 	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "production")
 
 	// Seed a staging check that IS success
 	seedCheck(t, svc, dbName, "staging", "success")
@@ -1226,7 +1229,7 @@ func TestE2EApplyProductionAllowedWhenStagingSuccess(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n  - production\n", dbName)
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
@@ -2268,7 +2271,7 @@ func TestE2EApplyStoresServerSideTarget(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n", dbName)
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}

@@ -218,6 +218,29 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	return svc
 }
 
+func configureE2EServiceEnvironments(t *testing.T, svc *api.Service, dbName string, environments ...string) {
+	t.Helper()
+	config := svc.Config()
+	if config.Databases == nil {
+		config.Databases = make(map[string]api.DatabaseConfig)
+	}
+	dbConfig := config.Databases[dbName]
+	if dbConfig.Type == "" {
+		dbConfig.Type = "mysql"
+	}
+	if dbConfig.Environments == nil {
+		dbConfig.Environments = make(map[string]api.EnvironmentConfig)
+	}
+	stagingConfig := dbConfig.Environments["staging"]
+	for _, environment := range environments {
+		if _, ok := dbConfig.Environments[environment]; ok {
+			continue
+		}
+		dbConfig.Environments[environment] = stagingConfig
+	}
+	config.Databases[dbName] = dbConfig
+}
+
 // seedCheck creates a check record in storage with common defaults.
 // Use conclusion "action_required" for pending changes, "success" for applied.
 func seedCheck(t *testing.T, svc *api.Service, dbName, env, conclusion string) {
@@ -805,7 +828,7 @@ func TestE2EMultiEnvPlan(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n  - production\n", dbName)
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
@@ -882,7 +905,7 @@ func TestE2EMultiEnvPlanDifferentChanges(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n  - production\n", dbName)
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
@@ -1527,7 +1550,7 @@ func TestE2EAggregateCheck(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n  - production\n", dbName)
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
@@ -3393,13 +3416,14 @@ func setupE2EServiceWithAllowedEnvs(t *testing.T, allowedEnvs []string) *api.Ser
 	return svc
 }
 
-// TestE2EAutoPlanFailsWhenRepoEnvironmentsAreNotAllowed verifies that
-// SchemaBot fails closed when schema files changed, but the repo's
-// schemabot.yaml only names environments this service is not allowed to
-// process. This is a configuration mismatch, not "no work".
-func TestE2EAutoPlanFailsWhenRepoEnvironmentsAreNotAllowed(t *testing.T) {
+// TestE2EAutoPlanFailsWhenConfiguredEnvironmentsAreNotAllowed verifies that
+// SchemaBot fails closed when schema files changed, but the server-configured
+// database environments do not overlap this service's allowed environments.
+// This is a configuration mismatch, not "no work".
+func TestE2EAutoPlanFailsWhenConfiguredEnvironmentsAreNotAllowed(t *testing.T) {
 	dbName := "webhook_no_owned_envs"
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"sandbox"})
+	configureE2EServiceEnvironments(t, svc, dbName, "staging", "production")
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -3408,10 +3432,10 @@ func TestE2EAutoPlanFailsWhenRepoEnvironmentsAreNotAllowed(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	// The repo config asks for staging and production, but this test service is
-	// configured to process only sandbox. SchemaBot cannot safely plan this
-	// schema change because none of the repo-configured environments are allowed.
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n  - production\n", dbName)
+	// The database is configured for staging and production, but this test service
+	// processes only sandbox. SchemaBot cannot safely plan this schema change
+	// because none of the configured environments are allowed.
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
@@ -3433,7 +3457,7 @@ func TestE2EAutoPlanFailsWhenRepoEnvironmentsAreNotAllowed(t *testing.T) {
 
 	// The webhook still accepts the PR event asynchronously, but auto-plan posts
 	// a failing aggregate because this service cannot process any environment
-	// named by schemabot.yaml.
+	// configured for the database.
 	select {
 	case cr := <-result.checkRuns:
 		assert.Equal(t, "SchemaBot (sandbox)", cr.Name)
@@ -3457,7 +3481,7 @@ func TestE2EAutoPlanFailsWhenRepoEnvironmentsAreNotAllowed(t *testing.T) {
 	// There should be no plan comment because no environment reached planning.
 	select {
 	case body := <-result.comments:
-		t.Fatalf("expected no plan comment when no repo-configured environments are allowed, got: %s", body)
+		t.Fatalf("expected no plan comment when no configured environments are allowed, got: %s", body)
 	case <-time.After(500 * time.Millisecond):
 	}
 }

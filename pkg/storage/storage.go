@@ -367,6 +367,12 @@ type ApplyOperationStore interface {
 	// MarkFailed sets state=failed, error_message, and completed_at on a child row.
 	MarkFailed(ctx context.Context, id int64, errMsg string) error
 
+	// SaveEngineResumeState stores opaque engine resume state on the operation.
+	SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *EngineResumeState) error
+
+	// GetEngineResumeState returns opaque engine resume state for the operation.
+	GetEngineResumeState(ctx context.Context, operationID int64) (*EngineResumeState, error)
+
 	// FindNextApplyOperation atomically claims the next child row that needs
 	// attention and refreshes its heartbeat in the same transaction.
 	//

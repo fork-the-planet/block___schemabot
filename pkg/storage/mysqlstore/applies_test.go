@@ -928,6 +928,123 @@ func TestApplyStore_FindNextApplyClaimsRetryable(t *testing.T) {
 	assert.Nil(t, claimedAgain)
 }
 
+// ClaimApplyByID claims one specific apply by ID with the same claimability
+// rules as FindNextApply. The operation-level claim loop uses it to acquire the
+// parent apply lease after claiming an apply_operations row, so a pending apply
+// with tasks must be claimable, the claim must rotate a fresh lease, and a
+// repeat claim must be rejected while the lease is fresh.
+func TestApplyStore_ClaimApplyByIDClaimsPendingWithTasks(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_pending", 600, state.Apply.Pending, "staging")
+	addClaimByIDTask(t, store, apply, "task_claim_by_id")
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.Pending, claimed.State, "caller sees the pre-claim state")
+	assert.Equal(t, "operator-a", claimed.LeaseOwner)
+	assert.NotEmpty(t, claimed.LeaseToken)
+	require.NotNil(t, claimed.LeaseAcquiredAt)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Running, persisted.State)
+	assert.Equal(t, "operator-a", persisted.LeaseOwner)
+
+	again, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-b")
+	require.NoError(t, err)
+	assert.Nil(t, again, "a freshly claimed apply is owned by its current worker")
+}
+
+// ClaimApplyByID must not steal a fresh lease from a healthy apply-level worker,
+// so a running apply with a fresh heartbeat is not claimable; it only becomes
+// claimable once its heartbeat goes stale, matching FindNextApply recovery.
+func TestApplyStore_ClaimApplyByIDSkipsFreshRunningUntilStale(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_running", 601, state.Apply.Running, "staging")
+
+	fresh, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	assert.Nil(t, fresh, "a fresh running apply is owned by its active worker")
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET updated_at = NOW() - INTERVAL 2 MINUTE
+		WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, state.Apply.Running, claimed.State)
+	assert.Equal(t, "operator-a", claimed.LeaseOwner)
+	assert.NotEmpty(t, claimed.LeaseToken)
+}
+
+// ClaimApplyByID returns nil for applies that are not claimable (terminal) or
+// do not exist, so the operation loop fails closed instead of driving work.
+func TestApplyStore_ClaimApplyByIDReturnsNilForTerminalAndMissing(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	completed := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_done", 602, state.Apply.Completed, "staging")
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, completed.ID, "operator-a")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "terminal applies are never claimable")
+
+	missing, err := store.Applies().ClaimApplyByID(ctx, 9_999_999, "operator-a")
+	require.NoError(t, err)
+	assert.Nil(t, missing, "a non-existent apply id yields no claim")
+}
+
+// ClaimApplyByID requires an owner so a lease can never be acquired without an
+// identity that lease-guarded writes can fail closed against.
+func TestApplyStore_ClaimApplyByIDRequiresOwner(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	_, err := store.Applies().ClaimApplyByID(ctx, 1, "")
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+}
+
+func addClaimByIDTask(t *testing.T, store *Storage, apply *storage.Apply, taskID string) {
+	t.Helper()
+	task := &storage.Task{
+		TaskIdentifier: taskID,
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Pending,
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `note` varchar(255)",
+		DDLAction:      "alter",
+		Options:        []byte("{}"),
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	id, err := store.Tasks().Create(t.Context(), task)
+	require.NoError(t, err)
+	task.ID = id
+}
+
 func TestApplyStore_LeaseGuardsOwnedWrites(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -1584,6 +1701,66 @@ func TestApplyStore_DeleteByPR(t *testing.T) {
 	applies, err = store.Applies().GetByPR(ctx, "org/repo", 200)
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
+}
+
+// TestApplyStore_Delete_RemovesApplyOperations verifies that deleting an apply
+// also removes its per-deployment apply_operations rows in the same transaction.
+// Orphan child rows would otherwise be re-claimed forever by the operator claim
+// loop, since their parent lookup returns nil.
+func TestApplyStore_Delete_RemovesApplyOperations(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_delete_ops", 610)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.Applies().Delete(ctx, apply.ID))
+
+	deleted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Nil(t, deleted)
+
+	op, err := store.ApplyOperations().Get(ctx, opID)
+	require.NoError(t, err)
+	require.Nil(t, op, "apply_operations row must be deleted with its parent apply")
+}
+
+// TestApplyStore_DeleteByPR_RemovesApplyOperations verifies that DeleteByPR
+// removes the apply_operations rows of the deleted applies while leaving other
+// PRs' operations intact.
+func TestApplyStore_DeleteByPR_RemovesApplyOperations(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock1 := createTestLockWithPR(t, store, "db1", "mysql", "staging", "org/repo", 110)
+	lock2 := createTestLockWithPR(t, store, "db2", "mysql", "staging", "org/repo", 210)
+	apply1 := createTestApply(t, store, lock1, "apply_pr110", 711)
+	apply2 := createTestApply(t, store, lock2, "apply_pr210", 712)
+
+	op1, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply1.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+	op2, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply2.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.Applies().DeleteByPR(ctx, "org/repo", 110))
+
+	got1, err := store.ApplyOperations().Get(ctx, op1)
+	require.NoError(t, err)
+	require.Nil(t, got1, "deleted PR's apply_operations row must be removed")
+
+	got2, err := store.ApplyOperations().Get(ctx, op2)
+	require.NoError(t, err)
+	require.NotNil(t, got2, "other PR's apply_operations row must be preserved")
 }
 
 func TestApplyStore_Options(t *testing.T) {

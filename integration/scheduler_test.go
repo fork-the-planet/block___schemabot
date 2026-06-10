@@ -213,6 +213,109 @@ func TestScheduler_BasicClaimAndResume(t *testing.T) {
 	)
 }
 
+// TestScheduler_OperatorClaimsOperationToCompletion exercises the operation-level
+// claim loop (operator_claim_operations enabled). An apply created through the
+// normal flow dual-writes exactly one apply_operations row; the operator claims
+// that row, acquires the parent apply lease, drives the schema change to
+// completion, and marks the operation row completed.
+func TestScheduler_OperatorClaimsOperationToCompletion(t *testing.T) {
+	ctx := t.Context()
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+
+	appDBName, appDSN := createTestDB(t, "operator_claim_")
+	ts := startTestServerOperator(t, appDBName, appDSN)
+
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+
+	applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{
+		"plan_id": planID, "environment": "staging",
+	})
+	require.True(t, applyResp["accepted"] == true)
+	applyID, _ := applyResp["apply_id"].(string)
+	require.NotEmpty(t, applyID)
+
+	waitForState(t, "http://"+ts.Addr, applyID, "completed", 20*time.Second)
+
+	apply, err := ts.Storage.Applies().GetByApplyIdentifier(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+
+	// The operator marks the operation terminal after the parent apply is
+	// persisted completed, so poll for the operation's terminal state rather
+	// than reading it the instant the apply finishes.
+	require.Eventually(t, func() bool {
+		ops, err := ts.Storage.ApplyOperations().ListByApply(ctx, apply.ID)
+		if err != nil || len(ops) != 1 {
+			return false
+		}
+		return state.IsState(ops[0].State, state.ApplyOperation.Completed)
+	}, 10*time.Second, 100*time.Millisecond,
+		"operator should mark the claimed operation completed after the apply finishes")
+
+	ops, err := ts.Storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 1, "apply-create dual-write emits exactly one operation row")
+	assert.Equal(t, state.ApplyOperation.Completed, ops[0].State, "operator marks the claimed operation completed")
+	assert.Equal(t, apply.Deployment, ops[0].Deployment)
+	require.NotNil(t, ops[0].CompletedAt, "completed operation stamps completed_at")
+}
+
+// TestScheduler_OperatorReconcilesOperationWhenParentTerminal covers the safety
+// case where the operator claims an apply_operations row whose parent apply is
+// already terminal — for example the operator flag is enabled after the apply
+// finished, or the parent reached a terminal state via another path. The
+// operator must reconcile the operation to the parent's terminal state rather
+// than re-claiming the same non-terminal row on every poll forever.
+func TestScheduler_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
+	ctx := t.Context()
+	appDBName, appDSN := createTestDB(t, "operator_reconcile_")
+	ts := startTestServerOperator(t, appDBName, appDSN)
+
+	now := time.Now()
+	applyID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-terminal-parent",
+		Database:        appDBName,
+		DatabaseType:    "mysql",
+		Deployment:      appDBName,
+		Engine:          "spirit",
+		State:           state.Apply.Completed,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+
+	opID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: appDBName,
+		Target:     appDBName,
+		State:      state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+		if err != nil || op == nil {
+			return false
+		}
+		return state.IsState(op.State, state.ApplyOperation.Completed)
+	}, 10*time.Second, 100*time.Millisecond,
+		"operator should reconcile the operation to completed when its parent apply is already completed")
+
+	op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+	require.NoError(t, err)
+	require.NotNil(t, op)
+	assert.Equal(t, state.ApplyOperation.Completed, op.State)
+	require.NotNil(t, op.CompletedAt, "reconciled completed operation stamps completed_at")
+}
+
 func TestScheduler_ClaimOrdering(t *testing.T) {
 	ctx := t.Context()
 

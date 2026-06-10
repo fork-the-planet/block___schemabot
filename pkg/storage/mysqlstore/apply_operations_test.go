@@ -690,6 +690,81 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsTerminal(t *testing.T) 
 	assert.Nil(t, claimed, "terminal rows must never be re-claimed (full vocabulary)")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingStart
+// verifies stop/start parity with ApplyStore.FindNextApply: a stopped operation
+// whose parent apply has a pending start request is reclaimable so the operator
+// can resume it. Without this, a stopped operation would strand the apply's
+// start request under the operation-claim path. The re-claim keeps the row's
+// stopped state (the resume drive transitions it) and refreshes the heartbeat.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingStart(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_stopped_start", 1, state.Apply.Stopped, "staging")
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Stopped,
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "stopped operation with a pending start request must be reclaimable")
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Stopped, claimed.State, "re-claim must keep the stopped state for the resume drive to transition")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.Stopped, persisted.State)
+	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_SkipsStoppedWithCompletedStart
+// verifies the claim predicate filters on a *pending* start request: once the
+// start request is no longer pending, the stopped operation is terminal again
+// and must not be re-claimed.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsStoppedWithCompletedStart(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_stopped_done", 1, state.Apply.Stopped, "staging")
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Stopped,
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+	// Move the start request out of pending; the stopped row is terminal again.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_control_requests SET status = ? WHERE apply_id = ? AND operation = ?
+	`, storage.ControlRequestCompleted, apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "stopped operation must not be reclaimed once its start request is no longer pending")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims verifies
 // the SKIP LOCKED contract on a contended row: N workers race to claim a
 // single pending child row, and exactly one wins. Mirrors the apply-level
@@ -756,6 +831,127 @@ func TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, persisted)
 	assert.Equal(t, state.ApplyOperation.Running, persisted.State)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_OrdersSiblings verifies that
+// a multi-deployment apply is claimed one deployment at a time, in insertion
+// (deployment_order) order: a later sibling stays unclaimable until every
+// earlier sibling has completed. This is the sequential rollout an operator
+// expects — region B never starts before region A finishes.
+func TestApplyOperationStore_FindNextApplyOperation_OrdersSiblings(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_ordered", 1)
+
+	deployments := []string{"region-a", "region-b", "region-c"}
+	ids := make([]int64, len(deployments))
+	for i, deployment := range deployments {
+		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: deployment,
+		})
+		require.NoError(t, err)
+		ids[i] = id
+	}
+
+	// Each claim returns the next deployment in order; the rollout only
+	// advances once the prior deployment is marked completed.
+	for i, deployment := range deployments {
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "deployment %q should be claimable once earlier siblings completed", deployment)
+		assert.Equal(t, ids[i], claimed.ID)
+		assert.Equal(t, deployment, claimed.Deployment)
+
+		// A second claim before completing the current row yields nothing:
+		// the claimed row is running (not completed), so it gates its siblings.
+		blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+		require.NoError(t, err)
+		assert.Nil(t, blocked, "later siblings must wait while %q is still running", deployment)
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, claimed.ID))
+	}
+
+	// All deployments completed → nothing left to claim.
+	done, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, done)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_HaltsOnFailedSibling verifies
+// halt-on-first-failure: when an earlier deployment has failed, no later
+// sibling of the same apply is claimed. The rollout stops until an operator
+// intervenes rather than racing ahead past a failed region.
+func TestApplyOperationStore_FindNextApplyOperation_HaltsOnFailedSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_halt", 1)
+
+	// region-a failed; region-b and region-c are pending behind it.
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed,
+	})
+	require.NoError(t, err)
+	for _, deployment := range []string{"region-b", "region-c"} {
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: deployment,
+		})
+		require.NoError(t, err)
+	}
+
+	// Backdate the failed row so staleness can't be the reason it's skipped —
+	// the only thing holding the rollout is the earlier non-completed sibling.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "later siblings must not be claimed once an earlier deployment failed")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_IsolatesApplies verifies the
+// sibling gate is scoped per apply: a blocked deployment in one apply does not
+// hold back the first deployment of an unrelated apply.
+func TestApplyOperationStore_FindNextApplyOperation_IsolatesApplies(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	// Each apply needs its own lock — only one apply may be active per target.
+	lockA := createTestLock(t, store, "testdb_a", "mysql", "staging")
+	lockB := createTestLock(t, store, "testdb_b", "mysql", "staging")
+
+	// Apply A: region-a running fresh, region-b pending behind it (blocked).
+	applyA := createTestApply(t, store, lockA, "apply_op_iso_a", 1)
+	runningID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: applyA.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApplyOperations().MarkStarted(ctx, runningID))
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: applyA.ID, Deployment: "region-b",
+	})
+	require.NoError(t, err)
+
+	// Apply B: its own first deployment is pending and must be claimable
+	// independently of apply A's in-flight rollout.
+	applyB := createTestApply(t, store, lockB, "apply_op_iso_b", 1)
+	bID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: applyB.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "an unrelated apply's first deployment must still be claimable")
+	assert.Equal(t, bID, claimed.ID, "the only claimable row is apply B's first deployment")
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_DBError covers the error

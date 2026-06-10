@@ -407,6 +407,16 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 // staleness window) are re-leased without changing their state. Terminal
 // rows are never claimed.
 //
+// Sibling ordering: a pending row is only claimable once every earlier
+// sibling of the same apply (lower created_at, id) has reached completed.
+// This serializes a multi-deployment apply along its deployment_order — the
+// order materialized by the apply-create dual-write into row insertion order
+// — and halts the rollout on the first non-completed sibling (e.g. a failed
+// deployment), since any earlier non-completed row blocks every later one.
+// The gate applies only to starting a pending row; an already-active row
+// re-leasing a stale heartbeat is recovering work it already started, so it
+// is never re-gated.
+//
 // Mirrors ApplyStore.FindNextApply: SELECT ... FOR UPDATE SKIP LOCKED to
 // avoid worker races, READ COMMITTED isolation to prevent next-key range
 // locks from serializing claims across otherwise independent rows.
@@ -424,15 +434,42 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
 
-	queryArgs := []any{state.ApplyOperation.Pending}
+	queryArgs := []any{state.ApplyOperation.Pending, state.ApplyOperation.Completed}
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.Stopped,
+		storage.ControlOperationStart, storage.ControlRequestPending)
 
+	// The stopped-row clause mirrors ApplyStore.FindNextApply: a stopped
+	// operation whose parent apply has a pending start request is reclaimable
+	// so the operator can resume it. Like the stale-active clause, it carries
+	// no deployment-order gate — a stopped row already ran, so resuming it is
+	// recovering work it started rather than starting a new deployment.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
 		WHERE (
-			state = ?
+			(
+				state = ?
+				AND NOT EXISTS (
+					SELECT 1
+					FROM apply_operations AS earlier
+					WHERE earlier.apply_id = apply_operations.apply_id
+						AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
+						AND earlier.state <> ?
+				)
+			)
 			OR (state IN (%s) AND updated_at < NOW() - INTERVAL %s)
+			OR (
+				state = ?
+				AND EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = apply_operations.apply_id
+						AND cr.operation = ?
+						AND cr.status = ?
+				)
+			)
 		)
 		ORDER BY created_at, id
 		LIMIT 1
@@ -468,7 +505,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 			return nil, nil
 		}
 	} else {
-		// Already-active stale row: just refresh the heartbeat as our lease.
+		// Re-leasing a row that already started: a stale active heartbeat, or a
+		// stopped operation whose parent apply has a pending start request. Both
+		// keep their current state and are driven by the caller, so just refresh
+		// the heartbeat as our lease.
 		_, err = tx.ExecContext(ctx, `
 			UPDATE apply_operations SET updated_at = NOW() WHERE id = ?
 		`, ad.ID)

@@ -14,6 +14,14 @@ func capitalizeFirst(s string) string {
 	return strings.ToUpper(s[:1]) + s[1:]
 }
 
+// humanizeState renders a canonical snake_case state constant as a
+// human-readable label (e.g. "waiting_for_cutover" → "Waiting for cutover").
+// Used by default branches so a state without an explicit template never
+// leaks a raw constant into a PR comment.
+func humanizeState(s string) string {
+	return capitalizeFirst(strings.ReplaceAll(s, "_", " "))
+}
+
 // TimestampFunc is the function used to generate timestamps in templates.
 // Override in previews/tests to produce deterministic output.
 var TimestampFunc = func() string {
@@ -31,6 +39,14 @@ func currentTimestamp() string {
 // writeErrorBlock writes an error message as a blockquote with warning emoji.
 func writeErrorBlock(sb *strings.Builder, msg string) {
 	fmt.Fprintf(sb, "\n> ⚠️ **Error:** %s\n", msg)
+}
+
+// writeTableErrorLine writes a task's last error as a blockquote below its
+// progress line. Newlines are quoted so multi-line engine errors stay inside
+// the quote instead of escaping into the surrounding comment structure.
+func writeTableErrorLine(sb *strings.Builder, msg string) {
+	quoted := strings.ReplaceAll(msg, "\n", "\n> ")
+	fmt.Fprintf(sb, "> ⚠️ Last error: %s\n", quoted)
 }
 
 // writeSuccessBlock writes a success message as a blockquote.

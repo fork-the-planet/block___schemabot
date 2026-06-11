@@ -99,11 +99,12 @@ type ServerConfig struct {
 	// Defaults to false (apply-level claiming).
 	OperatorClaimOperations bool `yaml:"operator_claim_operations,omitempty"`
 
-	// RequirePassingChecks blocks apply when non-SchemaBot PR checks are failing.
-	// When enabled (default), SchemaBot verifies that all other checks (CI, linters,
-	// security scans) have passed before executing a schema change. Checks with
-	// conclusion "neutral" or "skipped" are ignored. SchemaBot's own checks are
-	// excluded from the evaluation.
+	// RequirePassingChecks blocks apply when non-SchemaBot PR checks are not
+	// passing. When enabled (default), SchemaBot verifies that all other checks
+	// (CI, linters, security scans) have passed before executing a schema
+	// change. Completed checks are ignored only when their conclusion is
+	// "success", "neutral", or "skipped"; every other conclusion blocks apply.
+	// SchemaBot's own checks are excluded from the evaluation.
 	//
 	// Defaults to true when not configured (nil = enabled).
 	RequirePassingChecks *bool `yaml:"require_passing_checks"`
@@ -1126,7 +1127,7 @@ func (c *ServerConfig) ShouldRespondToUnscoped() bool {
 }
 
 // ShouldRequirePassingChecks returns whether apply should be blocked when
-// non-SchemaBot PR checks are failing. Defaults to true when not configured.
+// non-SchemaBot PR checks are not passing. Defaults to true when not configured.
 func (c *ServerConfig) ShouldRequirePassingChecks() bool {
 	if c == nil || c.RequirePassingChecks == nil {
 		return true

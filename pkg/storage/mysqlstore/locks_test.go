@@ -5,10 +5,12 @@ package mysqlstore
 import (
 	"database/sql"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/storage"
@@ -42,6 +44,248 @@ func TestLockStore_Acquire(t *testing.T) {
 		Owner:        "otheruser",
 	}
 	require.ErrorIs(t, store.Locks().Acquire(ctx, differentOwner), storage.ErrLockHeld)
+}
+
+// Re-acquiring a lock the same owner already holds succeeds and overwrites the
+// stored confirmation plan with the latest apply attempt's plan, so apply-confirm
+// loads the plan the human just reviewed rather than a stale one.
+func TestLockStore_Acquire_SameOwnerRefreshesPendingPlanID(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  "vitess",
+		Repository:    "org/repo",
+		PullRequest:   123,
+		Owner:         "org/repo#123",
+		PendingPlanID: "plan-1",
+	}))
+
+	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  "vitess",
+		Repository:    "org/repo",
+		PullRequest:   123,
+		Owner:         "org/repo#123",
+		PendingPlanID: "plan-2",
+	}))
+
+	lock, err := store.Locks().Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "org/repo#123", lock.Owner)
+	assert.Equal(t, "plan-2", lock.PendingPlanID)
+
+	// A re-acquire with an empty plan (rollback, CLI) leaves the stored plan intact.
+	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName: "testdb",
+		DatabaseType: "vitess",
+		Repository:   "org/repo",
+		PullRequest:  123,
+		Owner:        "org/repo#123",
+	}))
+	lock, err = store.Locks().Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "plan-2", lock.PendingPlanID)
+}
+
+// Two applies for the same PR and database (staging and production apply-confirms
+// share the owner repo#pr and the database+type lock key) may acquire the lock
+// concurrently. Every same-owner Acquire must succeed; none may be turned away
+// with ErrLockHeld by losing the insert race against itself.
+func TestLockStore_Acquire_SameOwnerConcurrent(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+
+	const workers = 16
+	stores := make([]*Storage, workers)
+	for i := range workers {
+		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		require.NoError(t, openErr)
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		t.Cleanup(func() {
+			require.NoError(t, db.Close())
+		})
+		stores[i] = New(db)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+
+	for i := range workers {
+		workerStore := stores[i]
+		planID := fmt.Sprintf("plan-%d", i)
+		wg.Go(func() {
+			<-start
+			err := workerStore.Locks().Acquire(ctx, &storage.Lock{
+				DatabaseName:  "testdb",
+				DatabaseType:  "vitess",
+				Repository:    "org/repo",
+				PullRequest:   123,
+				Owner:         "org/repo#123",
+				PendingPlanID: planID,
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+			}
+		})
+	}
+
+	close(start)
+	wg.Wait()
+
+	require.Empty(t, errs, "all same-owner Acquire calls should succeed")
+
+	lock, err := stores[0].Locks().Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "org/repo#123", lock.Owner)
+	assert.Contains(t, lock.PendingPlanID, "plan-", "stored plan should be one of the concurrent attempts")
+}
+
+// Under MySQL's default changed-rows semantics, a same-owner refresh whose new
+// confirmation plan already matches the stored value reports zero affected rows
+// even though the owner still holds the lock. This happens when a concurrent
+// same-owner caller wrote the same plan first. The refresh must treat the caller
+// as still holding the lock and succeed, not turn it away with ErrLockHeld.
+func TestLockStore_Acquire_RefreshSameOwnerValueAlreadyMatches(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+
+	db, err := sql.Open("mysql", testDSNChangedRows)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+	require.NoError(t, db.PingContext(ctx))
+	store := &lockStore{db: db}
+
+	require.NoError(t, store.Acquire(ctx, &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  "vitess",
+		Repository:    "org/repo",
+		PullRequest:   123,
+		Owner:         "org/repo#123",
+		PendingPlanID: "plan-1",
+	}))
+
+	// A concurrent same-owner caller already set pending_plan_id to plan-2.
+	_, err = db.ExecContext(ctx, `
+		UPDATE locks
+		SET pending_plan_id = ?
+		WHERE database_name = ? AND database_type = ? AND owner = ?
+	`, "plan-2", "testdb", "vitess", "org/repo#123")
+	require.NoError(t, err)
+
+	// This caller's refresh targets the same value. The UPDATE matches the row but
+	// changes nothing, so RowsAffected is 0 under changed-rows semantics. The caller
+	// still owns the lock, so the refresh must succeed.
+	err = store.refreshPendingPlanID(ctx,
+		&storage.Lock{
+			DatabaseName:  "testdb",
+			DatabaseType:  "vitess",
+			Owner:         "org/repo#123",
+			PendingPlanID: "plan-2",
+		},
+		&storage.Lock{
+			DatabaseName:  "testdb",
+			DatabaseType:  "vitess",
+			Owner:         "org/repo#123",
+			PendingPlanID: "plan-1",
+		})
+	require.NoError(t, err)
+
+	lock, err := store.Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "org/repo#123", lock.Owner)
+	assert.Equal(t, "plan-2", lock.PendingPlanID)
+
+	// A full same-owner Acquire whose plan already matches the stored value must
+	// also succeed for the same reason.
+	require.NoError(t, store.Acquire(ctx, &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  "vitess",
+		Repository:    "org/repo",
+		PullRequest:   123,
+		Owner:         "org/repo#123",
+		PendingPlanID: "plan-2",
+	}))
+}
+
+// When the lock changes hands between reading it and refreshing its confirmation
+// plan, the refresh must not silently succeed: the caller no longer holds the lock
+// and must learn the accurate cause (held by another owner, or gone entirely).
+func TestLockStore_Acquire_RefreshOwnerNoLongerMatches(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := &lockStore{db: testDB}
+
+	require.NoError(t, store.Acquire(ctx, &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  "vitess",
+		Repository:    "org/repo",
+		PullRequest:   123,
+		Owner:         "org/repo#123",
+		PendingPlanID: "plan-1",
+	}))
+
+	// The lock is reassigned to a different owner. A refresh that targets the old
+	// owner predicate now matches no rows and must report ErrLockHeld.
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE locks
+		SET owner = ?
+		WHERE database_name = ? AND database_type = ?
+	`, "org/repo#999", "testdb", "vitess")
+	require.NoError(t, err)
+
+	err = store.refreshPendingPlanID(ctx,
+		&storage.Lock{
+			DatabaseName:  "testdb",
+			DatabaseType:  "vitess",
+			Owner:         "org/repo#123",
+			PendingPlanID: "plan-2",
+		},
+		&storage.Lock{
+			DatabaseName:  "testdb",
+			DatabaseType:  "vitess",
+			Owner:         "org/repo#123",
+			PendingPlanID: "plan-1",
+		})
+	require.ErrorIs(t, err, storage.ErrLockHeld)
+
+	// The new owner's plan must be untouched by the missed refresh.
+	lock, err := store.Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "org/repo#999", lock.Owner)
+	assert.Equal(t, "plan-1", lock.PendingPlanID)
+
+	// The lock is released outright. A refresh against the gone lock must report
+	// ErrLockNotFound rather than silently succeeding.
+	require.NoError(t, store.ForceRelease(ctx, "testdb", "vitess"))
+	err = store.refreshPendingPlanID(ctx,
+		&storage.Lock{
+			DatabaseName:  "testdb",
+			DatabaseType:  "vitess",
+			Owner:         "org/repo#123",
+			PendingPlanID: "plan-3",
+		},
+		&storage.Lock{
+			DatabaseName:  "testdb",
+			DatabaseType:  "vitess",
+			Owner:         "org/repo#123",
+			PendingPlanID: "plan-1",
+		})
+	require.ErrorIs(t, err, storage.ErrLockNotFound)
 }
 
 func TestLockStore_Release(t *testing.T) {

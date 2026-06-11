@@ -439,12 +439,32 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
+	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
+	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 
-	// The stopped-row clause mirrors ApplyStore.FindNextApply: a stopped
-	// operation whose parent apply has a pending start request is reclaimable
-	// so the operator can resume it. Like the stale-active clause, it carries
-	// no deployment-order gate — a stopped row already ran, so resuming it is
-	// recovering work it started rather than starting a new deployment.
+	// The stopped-row and failed_retryable clauses mirror ApplyStore.FindNextApply:
+	// neither carries a deployment-order gate, because both rows already ran —
+	// resuming them is recovering work they started, not starting a new deployment.
+	//
+	//   - A stopped operation whose parent apply has a pending start request is
+	//     reclaimable so the operator can resume it.
+	//
+	//   - A failed_retryable operation is reclaimable only while its PARENT apply
+	//     is itself claimable for that operation's recovery. The operator claim
+	//     path drives the parent apply, so the operation row is a shadow of the
+	//     parent: gating on the parent's claimability (not just its retry budget)
+	//     is what keeps a healthy retry from being re-claimed every poll. The two
+	//     sub-conditions mirror the parent clauses in ApplyStore.FindNextApply:
+	//       * parent still failed_retryable, within recovery budget (attempt < max)
+	//         and recent — a fresh bounded retry; and
+	//       * parent already claimed into an active state but its lease has gone
+	//         stale — crash recovery, with no budget gate (the attempt was already
+	//         admitted and counted when the parent was claimed).
+	//     Claiming a failed_retryable parent transitions it to running and refreshes
+	//     applies.updated_at (see persistApplyClaim), so once a worker owns the
+	//     retry neither sub-condition matches and peers back off instead of
+	//     churning on a row another worker is actively driving.
 	//
 	// There is intentionally no "pending + pending start request" clause to
 	// match ApplyStore.FindNextApply's pending-start clause. That apply-level
@@ -483,11 +503,30 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 						AND cr.status = ?
 				)
 			)
+			OR (
+				state = ?
+				AND EXISTS (
+					SELECT 1
+					FROM applies a
+					WHERE a.id = apply_operations.apply_id
+						AND (
+							(
+								a.state = ?
+								AND a.attempt < ?
+								AND a.updated_at >= NOW() - INTERVAL ? DAY
+							)
+							OR (
+								a.state IN (%s)
+								AND a.updated_at < NOW() - INTERVAL %s
+							)
+						)
+				)
+			)
 		)
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, activeStatePlaceholders, applyOperationHeartbeatStaleness), queryArgs...)
+	`, applyOperationColumns, activeStatePlaceholders, applyOperationHeartbeatStaleness, activeStatePlaceholders, applyOperationHeartbeatStaleness), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

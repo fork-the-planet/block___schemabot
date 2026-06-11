@@ -152,6 +152,76 @@ func successfulNoOpPlanResult(check *storage.Check) bool {
 		!check.HasChanges
 }
 
+// MarkStalePlanSuccessful marks plan-only stored check state successful when its
+// database is no longer in the PR. The update is guarded so a started apply that
+// claimed the row after stale cleanup read it keeps blocking: a row that is
+// in_progress or owns an apply ID is left untouched, because a passing check must
+// never be derived from cleanup alone while an apply may have reached the live
+// database. Returns true when the row is in the plan-only successful state after
+// this call (whether this call wrote it or it already was), and false only when a
+// started apply still owns it.
+func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
+	var checkRunID any
+	if check.CheckRunID != 0 {
+		checkRunID = check.CheckRunID
+	}
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET head_sha = ?,
+		    check_run_id = ?,
+		    apply_id = NULL,
+		    has_changes = ?,
+		    status = ?,
+		    conclusion = ?,
+		    blocking_reason = ?,
+		    error_message = ?
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND status != ? AND apply_id IS NULL
+	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		checkStatusInProgress)
+	if err != nil {
+		return false, fmt.Errorf("mark stale plan check successful for %s#%d %s/%s/%s: %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected marking stale plan check successful for %s#%d %s/%s/%s: %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
+	}
+	if rows > 0 {
+		return true, nil
+	}
+
+	// Under changed-rows semantics, RowsAffected is 0 both when the guard
+	// excluded the row (an apply claimed it) and when the row already held the
+	// exact plan-only success values this call would have written. Re-read the
+	// row to tell these apart so an already-successful row is treated as success
+	// rather than left blocking.
+	current, err := s.Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	if err != nil {
+		return false, fmt.Errorf("re-read stale plan check after no-op update for %s#%d %s/%s/%s: %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
+	}
+	if current == nil {
+		return false, fmt.Errorf("stale plan check vanished after no-op update for %s#%d %s/%s/%s",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	}
+	return isPlanOnlySuccessful(current), nil
+}
+
+// isPlanOnlySuccessful reports whether stored check state is already in the
+// plan-only successful state stale cleanup converges to: a completed, successful
+// check with no started apply and no pending schema change.
+func isPlanOnlySuccessful(check *storage.Check) bool {
+	return check.Status == "completed" &&
+		check.Conclusion == "success" &&
+		check.ApplyID == 0 &&
+		!check.HasChanges
+}
+
 // CompleteForApply updates stored check state to a terminal state only if it
 // still belongs to the apply being completed.
 func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {

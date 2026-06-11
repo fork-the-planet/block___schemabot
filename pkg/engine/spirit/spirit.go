@@ -512,22 +512,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
-	// Determine overall state from Spirit's state
-	// Preserve terminal states (stopped, failed) - don't overwrite them
-	state := rm.state
-	if state == engine.StateStopped && rm.volumeRestartInProgress {
-		state = engine.StateRunning
-	}
-	if state != engine.StateStopped && state != engine.StateFailed {
-		switch spiritState {
-		case status.WaitingOnSentinelTable:
-			if rm.deferCutover {
-				state = engine.StateWaitingForCutover
-			}
-		case status.Close:
-			state = engine.StateCompleted
-		}
-	}
+	state := progressState(rm, spiritState)
 
 	// If state was overridden and message is still the default fallback, update message to match
 	defaultMessage := fmt.Sprintf("Schema change %s", rm.state)
@@ -543,6 +528,24 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		Tables:       tableProgress,
 		ResumeState:  req.ResumeState,
 	}, nil
+}
+
+// progressState resolves the state reported for a progress poll. The tracked
+// state is authoritative for terminal outcomes: they are recorded before the
+// runner is closed, so a runner observed mid-teardown never changes the
+// recorded outcome. Spirit's status only refines a non-terminal state, e.g.
+// surfacing the sentinel wait for a deferred cutover. A stopped tracked state
+// with a volume restart in flight reports running because the schema change
+// is restarting with new settings.
+func progressState(rm *runningMigration, spiritState status.State) engine.State {
+	state := rm.state
+	if state == engine.StateStopped && rm.volumeRestartInProgress {
+		state = engine.StateRunning
+	}
+	if !state.IsTerminal() && spiritState == status.WaitingOnSentinelTable && rm.deferCutover {
+		state = engine.StateWaitingForCutover
+	}
+	return state
 }
 
 // fetchCurrentSchema retrieves table schemas from the database, filtering out

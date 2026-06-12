@@ -8,6 +8,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestProtoSchemaFilesToAPIIgnoresNilNamespaces(t *testing.T) {
+	result := protoSchemaFilesToAPI(map[string]*ternv1.SchemaFiles{
+		"orders": nil,
+		"users":  {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint);\n"}},
+	})
+
+	require.Contains(t, result, "orders")
+	assert.Empty(t, result["orders"].Files)
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint);\n", result["users"].Files["users.sql"])
+}
+
 func TestChangeTypeRoundTrip(t *testing.T) {
 	// Proto → storage → proto should round-trip correctly
 	for _, ct := range []ternv1.ChangeType{

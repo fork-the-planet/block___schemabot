@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -246,6 +247,99 @@ func TestLocalClient_StopMarksMySQLApplyStopped(t *testing.T) {
 	assert.Equal(t, state.Apply.Stopped, apply.State)
 	assert.Nil(t, apply.CompletedAt)
 	require.NotNil(t, eng.stopReq, "stop should call the engine")
+}
+
+// A stop request can race with a worker that finalized all task rows but
+// exited before finalizing the apply row. When every targeted task is already
+// terminal, stop derives the apply's final state from its tasks: an apply
+// whose tasks failed must finish as failed, never as completed, so the
+// failure stays visible to operators instead of being masked as a success.
+// When the derived state is failed, the failure reason from the task rows is
+// propagated to the apply record so operators can triage without digging into
+// individual tasks; a reason already on the apply is kept.
+func TestLocalClient_StopAllTasksTerminalDerivesApplyState(t *testing.T) {
+	testCases := []struct {
+		name              string
+		taskStates        []string
+		taskErrors        []string
+		applyErrorMessage string
+		wantApplyState    string
+		wantErrorMessage  string
+	}{
+		{
+			name:           "all tasks completed",
+			taskStates:     []string{state.Task.Completed, state.Task.Completed},
+			wantApplyState: state.Apply.Completed,
+		},
+		{
+			name:             "all tasks failed",
+			taskStates:       []string{state.Task.Failed, state.Task.Failed},
+			taskErrors:       []string{"", "row copy failed: lock wait timeout"},
+			wantApplyState:   state.Apply.Failed,
+			wantErrorMessage: "table t2 failed: row copy failed: lock wait timeout",
+		},
+		{
+			name:             "failed task among completed tasks",
+			taskStates:       []string{state.Task.Completed, state.Task.Failed},
+			taskErrors:       []string{"", "cutover failed: deadlock detected"},
+			wantApplyState:   state.Apply.Failed,
+			wantErrorMessage: "table t2 failed: cutover failed: deadlock detected",
+		},
+		{
+			name:              "existing apply error message is kept",
+			taskStates:        []string{state.Task.Failed, state.Task.Failed},
+			taskErrors:        []string{"row copy failed: lock wait timeout", ""},
+			applyErrorMessage: "operator recorded failure reason",
+			wantApplyState:    state.Apply.Failed,
+			wantErrorMessage:  "operator recorded failure reason",
+		},
+		{
+			name:           "all tasks cancelled",
+			taskStates:     []string{state.Task.Cancelled, state.Task.Cancelled},
+			wantApplyState: state.Apply.Cancelled,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-mysql-stop-terminal",
+				State:           state.Apply.Running,
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				ErrorMessage:    tc.applyErrorMessage,
+			}
+			tasks := make([]*storage.Task, 0, len(tc.taskStates))
+			for i, taskState := range tc.taskStates {
+				task := &storage.Task{
+					ID:             int64(i + 1),
+					ApplyID:        apply.ID,
+					TaskIdentifier: fmt.Sprintf("task-mysql-stop-terminal-%d", i+1),
+					TableName:      fmt.Sprintf("t%d", i+1),
+					Database:       "testdb",
+					State:          taskState,
+				}
+				if i < len(tc.taskErrors) {
+					task.ErrorMessage = tc.taskErrors[i]
+				}
+				tasks = append(tasks, task)
+			}
+			client := newMySQLControlTestClient(apply, tasks, &controlCaptureEngine{})
+
+			resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+			require.NoError(t, err)
+			assert.True(t, resp.Accepted)
+			assert.Equal(t, int64(0), resp.StoppedCount)
+			assert.Equal(t, int64(len(tasks)), resp.SkippedCount)
+			assert.Equal(t, "Schema change already "+tc.wantApplyState, resp.ErrorMessage)
+			assert.Equal(t, tc.wantApplyState, apply.State)
+			assert.Equal(t, tc.wantErrorMessage, apply.ErrorMessage)
+			require.NotNil(t, apply.CompletedAt)
+		})
+	}
 }
 
 // PlanetScale cutover must include the opaque resume state recorded for the

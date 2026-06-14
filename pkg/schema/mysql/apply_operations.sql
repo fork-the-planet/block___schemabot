@@ -9,6 +9,7 @@ CREATE TABLE `apply_operations` (
   `error_message` text,
   `cutover_policy` varchar(16) NOT NULL DEFAULT 'rolling',
   `halt_on_failure` tinyint(1) NOT NULL DEFAULT '1',
+  `on_failure` varchar(16) NOT NULL DEFAULT 'halt',
   `lease_owner` varchar(255) NOT NULL DEFAULT '',
   `lease_token` varchar(64) NOT NULL DEFAULT '',
   `lease_acquired_at` datetime DEFAULT NULL,

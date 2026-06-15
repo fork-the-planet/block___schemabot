@@ -2,12 +2,14 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"reflect"
 	"slices"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/statement"
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -98,15 +100,24 @@ type fakeControlEngine struct {
 	progressReq    *engine.ProgressRequest
 	progressResult *engine.ProgressResult
 	progressErr    error
+	planResult     *engine.PlanResult
+	applyResult    *engine.ApplyResult
+	applyErr       error
 }
 
 func (e *fakeControlEngine) Name() string { return "fake" }
 
 func (e *fakeControlEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	if e.planResult != nil {
+		return e.planResult, nil
+	}
 	return &engine.PlanResult{}, nil
 }
 
 func (e *fakeControlEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	if e.applyResult != nil || e.applyErr != nil {
+		return e.applyResult, e.applyErr
+	}
 	return &engine.ApplyResult{Accepted: true}, nil
 }
 
@@ -188,12 +199,16 @@ func (s *exactProgressVitessApplyDataStore) GetByApplyID(context.Context, int64)
 
 type exactProgressApplyOperationStore struct {
 	storage.ApplyOperationStore
-	data  *storage.EngineResumeState
-	err   error
-	saved *storage.EngineResumeState
+	data    *storage.EngineResumeState
+	err     error
+	saveErr error
+	saved   *storage.EngineResumeState
 }
 
 func (s *exactProgressApplyOperationStore) SaveEngineResumeState(_ context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
 	if s.err != nil {
 		return s.err
 	}
@@ -476,6 +491,270 @@ func TestLocalClient_VitessProgressPassesAndPersistsEngineResumeState(t *testing
 	require.Len(t, progress.Tables, 1)
 	assert.Equal(t, int32(42), progress.Tables[0].PercentComplete)
 	assert.True(t, progress.Tables[0].IsInstant)
+}
+
+func groupedResumeStateClient(databaseType string, applyOperations storage.ApplyOperationStore) *LocalClient {
+	return &LocalClient{
+		config:  LocalConfig{Database: "testdb", Type: databaseType},
+		storage: &exactProgressStorage{applyOperations: applyOperations},
+		logger:  slog.Default(),
+	}
+}
+
+// A grouped resume must hand the engine its persisted state so the engine
+// reattaches to in-flight work instead of starting a duplicate schema change.
+func TestGroupedResumeStateUsesPersistedEngineState(t *testing.T) {
+	operationID := int64(11)
+	apply := &storage.Apply{ID: 4, ApplyIdentifier: "apply-resume-state", Database: "testdb", DatabaseType: storage.DatabaseTypeVitess}
+	tasks := []*storage.Task{{TaskIdentifier: "task-a", ApplyOperationID: &operationID}}
+	persistedMetadata := `{"branch_name":"branch-9","deploy_request_id":9}`
+	store := &exactProgressApplyOperationStore{data: &storage.EngineResumeState{
+		ApplyOperationID: operationID,
+		MigrationContext: "ctx-resume",
+		Metadata:         persistedMetadata,
+	}}
+	client := groupedResumeStateClient(storage.DatabaseTypeVitess, store)
+
+	resumeState, err := client.groupedResumeState(t.Context(), apply, tasks)
+	require.NoError(t, err)
+	assert.Equal(t, "ctx-resume", resumeState.MigrationContext)
+	assert.JSONEq(t, persistedMetadata, resumeState.Metadata)
+}
+
+// Absent persisted state is expected for engines that reattach through durable
+// database-side checkpoints: the resume proceeds from the schema change
+// context alone instead of failing the recovery attempt.
+func TestGroupedResumeStateFallsBackToContextWhenAbsent(t *testing.T) {
+	operationID := int64(11)
+	apply := &storage.Apply{ID: 4, ApplyIdentifier: "apply-resume-absent", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	tasks := []*storage.Task{{TaskIdentifier: "task-a", ApplyOperationID: &operationID}}
+	client := groupedResumeStateClient(storage.DatabaseTypeMySQL, &exactProgressApplyOperationStore{})
+
+	resumeState, err := client.groupedResumeState(t.Context(), apply, tasks)
+	require.NoError(t, err)
+	assert.Equal(t, "apply-resume-absent", resumeState.MigrationContext)
+	assert.Empty(t, resumeState.Metadata)
+}
+
+// A storage read failure is distinct from absent state: the resume attempt
+// must fail so a later attempt can retry with intact persisted state, instead
+// of launching engine work that may duplicate an in-flight schema change.
+func TestGroupedResumeStateFailsOnStorageError(t *testing.T) {
+	operationID := int64(11)
+	apply := &storage.Apply{ID: 4, ApplyIdentifier: "apply-resume-storage-error", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	tasks := []*storage.Task{{TaskIdentifier: "task-a", ApplyOperationID: &operationID}}
+	storageErr := errors.New("storage unavailable")
+	client := groupedResumeStateClient(storage.DatabaseTypeMySQL, &exactProgressApplyOperationStore{err: storageErr})
+
+	_, err := client.groupedResumeState(t.Context(), apply, tasks)
+	require.ErrorIs(t, err, storageErr)
+	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+	assert.ErrorContains(t, err, "apply-resume-storage-error")
+}
+
+// A Vitess apply whose tasks cannot be resolved to an apply operation cannot
+// prove there is no in-flight deploy request to reattach to, so the resume
+// fails closed. Engines that reattach from the schema change context alone
+// proceed without an apply operation.
+func TestGroupedResumeStateRequiresApplyOperationForVitess(t *testing.T) {
+	tasks := []*storage.Task{{TaskIdentifier: "task-unlinked"}}
+
+	vitessApply := &storage.Apply{ApplyIdentifier: "apply-unlinked-vitess", Database: "testdb", DatabaseType: storage.DatabaseTypeVitess}
+	vitessClient := groupedResumeStateClient(storage.DatabaseTypeVitess, &exactProgressApplyOperationStore{})
+	_, err := vitessClient.groupedResumeState(t.Context(), vitessApply, tasks)
+	require.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+	assert.ErrorContains(t, err, "apply-unlinked-vitess")
+
+	mysqlApply := &storage.Apply{ApplyIdentifier: "apply-unlinked-mysql", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	mysqlClient := groupedResumeStateClient(storage.DatabaseTypeMySQL, &exactProgressApplyOperationStore{})
+	resumeState, err := mysqlClient.groupedResumeState(t.Context(), mysqlApply, tasks)
+	require.NoError(t, err)
+	assert.Equal(t, "apply-unlinked-mysql", resumeState.MigrationContext)
+	assert.Empty(t, resumeState.Metadata)
+}
+
+// reattachResumeFixture builds a Vitess apply that has already reattached to an
+// in-flight deploy request: the engine accepts the grouped resume, so the apply
+// owner must not write terminal failure when post-accept resume-state handling
+// goes wrong. The fake engine's plan keeps the task active through the final
+// schema check so the resume reaches the post-accept persistence path.
+func reattachResumeFixture(applyOperations storage.ApplyOperationStore, applyResult *engine.ApplyResult) (*LocalClient, *storage.Apply, []*storage.Task, *storage.Plan, *exactProgressApplyStore) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-reattach-vitess",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Engine:          storage.EnginePlanetScale,
+		State:           state.Apply.Recovering,
+	}
+	tasks := []*storage.Task{{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-reattach",
+		Database:         "testdb",
+		DatabaseType:     storage.DatabaseTypeVitess,
+		Engine:           storage.EnginePlanetScale,
+		Namespace:        "commerce",
+		TableName:        "users",
+		DDL:              "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		DDLAction:        "alter",
+		State:            state.Task.Recovering,
+	}}
+	plan := &storage.Plan{PlanIdentifier: "plan-reattach"}
+	eng := &fakeControlEngine{
+		planResult: &engine.PlanResult{Changes: []engine.SchemaChange{{
+			Namespace: "commerce",
+			TableChanges: []engine.TableChange{{
+				Table: "users",
+				DDL:   "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			}},
+		}}},
+		applyResult: applyResult,
+	}
+	applyStore := &exactProgressApplyStore{apply: apply}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies:         applyStore,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			applyOperations: applyOperations,
+		},
+		planetscaleEngine: eng,
+		logger:            slog.Default(),
+	}
+	return client, apply, tasks, plan, applyStore
+}
+
+// After the engine accepts the grouped resume a deploy request is running on the
+// provider. A failure to persist the returned resume state is storage
+// uncertainty, not a failed schema change: the apply owner exits non-terminally
+// so an operator can retry against the in-flight work instead of abandoning it.
+func TestLaunchAtomicResumeSaveFailureStaysRecoverable(t *testing.T) {
+	store := &exactProgressApplyOperationStore{
+		data: &storage.EngineResumeState{
+			ApplyOperationID: 7,
+			MigrationContext: "ctx-reattach",
+			Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+		},
+		saveErr: errors.New("storage unavailable"),
+	}
+	applyResult := &engine.ApplyResult{
+		Accepted: true,
+		ResumeState: &engine.ResumeState{
+			MigrationContext: "ctx-reattach",
+			Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+		},
+	}
+	client, apply, tasks, plan, applyStore := reattachResumeFixture(store, applyResult)
+
+	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, buildApplyOptions(apply), "Recovering from checkpoint", false, false)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+	assert.ErrorContains(t, err, "apply-reattach-vitess")
+	assert.False(t, state.IsTerminalApplyState(applyStore.apply.State),
+		"in-flight apply must stay recoverable, not terminal: got %s", applyStore.apply.State)
+	assert.NotEqual(t, state.Apply.Failed, applyStore.apply.State)
+}
+
+// The Vitess poll loop is driven by resume-state metadata, so an accepted resume
+// that returns no metadata leaves the owner unable to track the in-flight deploy
+// request. That ambiguity is non-terminal: the owner exits for operator retry
+// rather than failing an apply whose deploy request is still running.
+func TestLaunchAtomicResumeMissingMetadataStaysRecoverable(t *testing.T) {
+	store := &exactProgressApplyOperationStore{
+		data: &storage.EngineResumeState{
+			ApplyOperationID: 7,
+			MigrationContext: "ctx-reattach",
+			Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+		},
+	}
+	applyResult := &engine.ApplyResult{
+		Accepted: true,
+		ResumeState: &engine.ResumeState{
+			MigrationContext: "ctx-reattach",
+			Metadata:         "",
+		},
+	}
+	client, apply, tasks, plan, applyStore := reattachResumeFixture(store, applyResult)
+
+	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, buildApplyOptions(apply), "Recovering from checkpoint", false, false)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+	assert.ErrorContains(t, err, "apply-reattach-vitess")
+	assert.False(t, state.IsTerminalApplyState(applyStore.apply.State),
+		"in-flight apply must stay recoverable, not terminal: got %s", applyStore.apply.State)
+	assert.NotEqual(t, state.Apply.Failed, applyStore.apply.State)
+}
+
+// Rebuilt resume changes must preserve each task's namespace and table so
+// engines key per-table progress on the same identity the stored tasks carry.
+func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
+	tasks := []*storage.Task{
+		{Namespace: "commerce", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter"},
+		{Namespace: "commerce", TableName: "orders", DDL: "CREATE TABLE `orders` (`id` bigint unsigned NOT NULL)", DDLAction: "create"},
+		{Namespace: "billing", TableName: "invoices", DDL: "ALTER TABLE `invoices` ADD COLUMN `due_at` datetime", DDLAction: "alter"},
+	}
+
+	changes := groupedResumeChanges(tasks)
+
+	require.Len(t, changes, 2)
+	assert.Equal(t, "commerce", changes[0].Namespace)
+	require.Len(t, changes[0].TableChanges, 2)
+	assert.Equal(t, "users", changes[0].TableChanges[0].Table)
+	assert.Equal(t, tasks[0].DDL, changes[0].TableChanges[0].DDL)
+	assert.Equal(t, statement.StatementAlterTable, changes[0].TableChanges[0].Operation)
+	assert.Equal(t, "orders", changes[0].TableChanges[1].Table)
+	assert.Equal(t, tasks[1].DDL, changes[0].TableChanges[1].DDL)
+	assert.Equal(t, statement.StatementCreateTable, changes[0].TableChanges[1].Operation)
+	assert.Equal(t, "billing", changes[1].Namespace)
+	require.Len(t, changes[1].TableChanges, 1)
+	assert.Equal(t, "invoices", changes[1].TableChanges[0].Table)
+	assert.Equal(t, tasks[2].DDL, changes[1].TableChanges[0].DDL)
+	assert.Equal(t, statement.StatementAlterTable, changes[1].TableChanges[0].Operation)
+}
+
+// A VSchema task carries no DDL, so a resumed apply with mixed VSchema and DDL
+// work must keep the VSchema out of TableChanges and instead flag its namespace
+// with the vschema_changed metadata. This is how the engine knows to re-apply
+// vschema.json from the schema files on resume.
+func TestGroupedResumeChangesCarriesVSchemaMetadata(t *testing.T) {
+	tasks := []*storage.Task{
+		{Namespace: "commerce", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter"},
+		{Namespace: "commerce", TableName: "VSchema: commerce", DDLAction: "vschema_update"},
+	}
+
+	changes := groupedResumeChanges(tasks)
+
+	require.Len(t, changes, 1)
+	assert.Equal(t, "commerce", changes[0].Namespace)
+	require.Len(t, changes[0].TableChanges, 1)
+	assert.Equal(t, "users", changes[0].TableChanges[0].Table)
+	assert.Equal(t, tasks[0].DDL, changes[0].TableChanges[0].DDL)
+	assert.Equal(t, statement.StatementAlterTable, changes[0].TableChanges[0].Operation)
+	assert.Equal(t, "true", changes[0].Metadata["vschema_changed"])
+	for _, tc := range changes[0].TableChanges {
+		assert.NotEmpty(t, tc.DDL, "resume changes must not contain an empty-DDL table change")
+	}
+}
+
+// A VSchema-only apply has no DDL tasks. Its resumed change must still carry a
+// namespace flagged with vschema_changed and no table changes, so the engine
+// applies vschema.json without attempting to execute an empty statement.
+func TestGroupedResumeChangesVSchemaOnly(t *testing.T) {
+	tasks := []*storage.Task{
+		{Namespace: "commerce", TableName: "VSchema: commerce", DDLAction: "vschema_update"},
+	}
+
+	changes := groupedResumeChanges(tasks)
+
+	require.Len(t, changes, 1)
+	assert.Equal(t, "commerce", changes[0].Namespace)
+	assert.Empty(t, changes[0].TableChanges)
+	assert.Equal(t, "true", changes[0].Metadata["vschema_changed"])
 }
 
 func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {

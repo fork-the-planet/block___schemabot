@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,8 +23,10 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook"
@@ -257,51 +260,18 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	return server.Shutdown(ctx)
 }
 
-// startGRPCServer starts a gRPC server serving the Tern proto.
-// It creates a LocalClient for the first database in config using TERN_ENVIRONMENT's DSN.
+// startGRPCServer starts a gRPC server serving the Tern proto. When the data
+// plane is configured with a target resolver, requests are routed by opaque
+// execution target through a TargetRouter; otherwise it falls back to a single
+// LocalClient bound to the one database configured for TERN_ENVIRONMENT.
 func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, port string) (*grpc.Server, error) {
-	env := os.Getenv("TERN_ENVIRONMENT")
-	if env == "" {
-		return nil, fmt.Errorf("TERN_ENVIRONMENT is required when GRPC_PORT is set")
-	}
-
-	// Find the first database in config and create a LocalClient for it
-	var localClient tern.Client
-	for dbName, dbConfig := range config.Databases {
-		envConfig, ok := dbConfig.Environments[env]
-		if !ok {
-			continue
-		}
-		if !envConfig.HasLocalDSN() {
-			continue
-		}
-		targetDSN, err := envConfig.ResolveDSN()
-		if err != nil {
-			return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
-		}
-		var metadata map[string]string
-		if !config.PendingDropsEnabled() {
-			metadata = map[string]string{"pending_drops": "false"}
-		}
-		localClient, err = tern.NewLocalClient(tern.LocalConfig{
-			Database:  dbName,
-			Type:      dbConfig.Type,
-			TargetDSN: targetDSN,
-			Metadata:  metadata,
-		}, st, logger)
-		if err != nil {
-			return nil, fmt.Errorf("create local client for %s: %w", dbName, err)
-		}
-		logger.Info("gRPC server using database", "database", dbName, "environment", env)
-		break
-	}
-
-	if localClient == nil {
-		return nil, fmt.Errorf("no database found for environment %q in config", env)
+	client, err := buildGRPCTernClient(config, st, logger, os.Getenv("TERN_ENVIRONMENT"))
+	if err != nil {
+		return nil, err
 	}
 
 	grpcSrv := grpc.NewServer()
-	ternServer := tern.NewServer(localClient)
+	ternServer := tern.NewServer(client)
 	ternServer.Register(grpcSrv)
 
 	var lc net.ListenConfig
@@ -318,6 +288,92 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 	}()
 
 	return grpcSrv, nil
+}
+
+// buildGRPCTernClient builds the tern.Client backing the data-plane gRPC server.
+// When a target resolver is configured, it returns a TargetRouter that resolves
+// each request's opaque target to a connection per request; the server-level
+// environment is unused in this mode because each request carries its own.
+// Otherwise it falls back to a single LocalClient bound to the one database
+// configured for env.
+func buildGRPCTernClient(config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string) (tern.Client, error) {
+	if config.TargetResolver.Configured() {
+		resolver, err := inventory.NewStaticResolver(config.TargetResolver.StaticInventory())
+		if err != nil {
+			return nil, fmt.Errorf("build static target resolver: %w", err)
+		}
+		router, err := tern.NewTargetRouter(tern.TargetRouterConfig{
+			Resolver:           resolver,
+			Storage:            st,
+			Logger:             logger,
+			LocalClientFactory: grpcLocalClientFactory(config),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("build target router: %w", err)
+		}
+		logger.Info("gRPC server routing by target resolver", "targets", len(config.TargetResolver.Targets))
+		return router, nil
+	}
+
+	// Single-database fallback selects the one database in config with a local
+	// DSN for env. It requires an environment to select against.
+	if env == "" {
+		return nil, fmt.Errorf("TERN_ENVIRONMENT is required for single-database gRPC mode; set it or configure target_resolver")
+	}
+
+	// A single LocalClient serves exactly one database, so selection must be
+	// deterministic and unambiguous. More than one match is a configuration
+	// error rather than a nondeterministic pick over map iteration order.
+	var matches []string
+	for dbName, dbConfig := range config.Databases {
+		envConfig, ok := dbConfig.Environments[env]
+		if !ok || !envConfig.HasLocalDSN() {
+			continue
+		}
+		matches = append(matches, dbName)
+	}
+	sort.Strings(matches)
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("no database with a local DSN found for environment %q in config", env)
+	case 1:
+		// Exactly one database matches — serve it below.
+	default:
+		return nil, fmt.Errorf("environment %q matches %d databases with local DSNs (%s); single-database gRPC mode serves one database — configure target_resolver to route multiple", env, len(matches), strings.Join(matches, ", "))
+	}
+
+	dbName := matches[0]
+	dbConfig := config.Databases[dbName]
+	targetDSN, err := dbConfig.Environments[env].ResolveDSN()
+	if err != nil {
+		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
+	}
+	client, err := grpcLocalClientFactory(config)(tern.LocalConfig{
+		Database:  dbName,
+		Type:      dbConfig.Type,
+		TargetDSN: targetDSN,
+	}, st, logger)
+	if err != nil {
+		return nil, fmt.Errorf("create local client for %s: %w", dbName, err)
+	}
+	logger.Info("gRPC server using database", "database", dbName, "environment", env)
+	return client, nil
+}
+
+// grpcLocalClientFactory returns a LocalClientFactory that applies server-level
+// policy (pending drops) to every LocalClient the data plane builds, so the
+// router and single-database paths share identical execution semantics.
+func grpcLocalClientFactory(config *api.ServerConfig) tern.LocalClientFactory {
+	pendingDropsDisabled := !config.PendingDropsEnabled()
+	return func(cfg tern.LocalConfig, st storage.Storage, logger *slog.Logger) (tern.Client, error) {
+		if pendingDropsDisabled {
+			if cfg.Metadata == nil {
+				cfg.Metadata = map[string]string{}
+			}
+			cfg.Metadata["pending_drops"] = "false"
+		}
+		return tern.NewLocalClient(cfg, st, logger)
+	}
 }
 
 func buildWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (webhookRuntime, error) {

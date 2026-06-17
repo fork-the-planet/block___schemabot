@@ -675,6 +675,69 @@ type mockStorage struct {
 	plans           *mockPlanStore
 	logs            *mockApplyLogStore
 	controlRequests *testControlRequestStore
+	operations      *mockApplyOperationStore
+}
+
+// mockApplyOperationStore is an in-memory ApplyOperationStore for the remote
+// drive tests. It backs the operation lookups (Get/ListByApply) and the per-op
+// remote resume id write (SaveEngineResumeState) that the fan-out drive uses.
+type mockApplyOperationStore struct {
+	storage.ApplyOperationStore
+	ops          map[int64]*storage.ApplyOperation
+	saveErr      error
+	savedResumes []*storage.EngineResumeState
+}
+
+func (m *mockApplyOperationStore) Get(_ context.Context, id int64) (*storage.ApplyOperation, error) {
+	op, ok := m.ops[id]
+	if !ok {
+		return nil, storage.ErrApplyOperationNotFound
+	}
+	return op, nil
+}
+
+func (m *mockApplyOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
+	var ops []*storage.ApplyOperation
+	for _, op := range m.ops {
+		if op != nil && op.ApplyID == applyID {
+			ops = append(ops, op)
+		}
+	}
+	return ops, nil
+}
+
+func (m *mockApplyOperationStore) UpdateState(_ context.Context, id int64, newState string) error {
+	op, ok := m.ops[id]
+	if !ok {
+		return storage.ErrApplyOperationNotFound
+	}
+	op.State = newState
+	return nil
+}
+
+func (m *mockApplyOperationStore) MarkTerminal(_ context.Context, id int64, newState string) error {
+	op, ok := m.ops[id]
+	if !ok {
+		return storage.ErrApplyOperationNotFound
+	}
+	now := time.Now()
+	op.State = newState
+	op.CompletedAt = &now
+	return nil
+}
+
+func (m *mockApplyOperationStore) SaveEngineResumeState(_ context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
+	if m.saveErr != nil {
+		return m.saveErr
+	}
+	op, ok := m.ops[operationID]
+	if !ok {
+		return storage.ErrApplyOperationNotFound
+	}
+	op.EngineResumeContext = resumeState.MigrationContext
+	op.EngineResumeMetadata = resumeState.Metadata
+	m.savedResumes = append(m.savedResumes, resumeState)
+	return nil
 }
 
 func (m *mockStorage) Applies() storage.ApplyStore {
@@ -706,6 +769,12 @@ func (m *mockStorage) ControlRequests() storage.ControlRequestStore {
 		return m.controlRequests
 	}
 	return &testControlRequestStore{}
+}
+func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore {
+	if m.operations != nil {
+		return m.operations
+	}
+	return &mockApplyOperationStore{}
 }
 
 func testCapturingGRPCClient(t *testing.T, server *capturingTernServer) (*GRPCClient, func()) {
@@ -859,6 +928,9 @@ func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
 			ID:             apply.PlanID,
 			PlanIdentifier: "plan-op-scoped",
 		}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "testdb-deployment", State: state.ApplyOperation.Pending},
+		}},
 	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
@@ -874,6 +946,147 @@ func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
 	require.NotNil(t, req, "expected operation-scoped apply to be dispatched to remote Tern")
 	require.Len(t, req.DdlChanges, 1)
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
+}
+
+func TestGRPCClient_ResumeApplyOperationStoresRemoteIDOnOperationForMultiOpApply(t *testing.T) {
+	// On a multi-deployment apply, each deployment gets its own remote Tern apply
+	// id. Dispatching one operation must store its remote id on that operation's
+	// engine_resume_context and must NOT touch the parent applies.external_id,
+	// which has no single authoritative value across deployments.
+	server := &capturingTernServer{
+		remoteApplyID: "remote-op-west-1",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-multi-op",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target", DeferCutover: true})
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:        "alter",
+		Namespace:        "default",
+		State:            state.Task.Pending,
+	}
+	taskStore := &mockTaskStore{
+		tasks:           []*storage.Task{task},
+		getByApplyIDErr: errors.New("whole-apply task load must not be used for operation-scoped resume"),
+	}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Pending},
+		siblingID:   {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Pending},
+	}}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   taskStore,
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-multi-op",
+		}},
+		operations: operationStore,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.NoError(t, err)
+
+	assert.Empty(t, apply.ExternalID, "multi-op dispatch must not write the parent apply external_id")
+	assert.Equal(t, "remote-op-west-1", operationStore.ops[operationID].EngineResumeContext,
+		"the remote apply id must be stored on the claimed operation")
+	assert.Empty(t, operationStore.ops[siblingID].EngineResumeContext,
+		"the sibling operation's remote id must be untouched")
+	require.Len(t, operationStore.savedResumes, 1)
+	assert.Equal(t, operationID, operationStore.savedResumes[0].ApplyOperationID)
+	assert.Equal(t, "remote-op-west-1", operationStore.savedResumes[0].MigrationContext)
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req)
+	require.Len(t, req.DdlChanges, 1)
+	assert.Equal(t, "users", req.DdlChanges[0].TableName)
+}
+
+func TestGRPCClient_ResumeApplyOperationStopsUndispatchedOperationWithoutCompletingApplyStop(t *testing.T) {
+	// A multi-deployment apply has one durable stop request shared by every
+	// deployment. Stopping a claimed-but-undispatched operation (no remote apply
+	// id yet) must terminalize only that operation, leave the parent apply
+	// untouched, and keep the apply-level stop request pending so sibling
+	// deployments that already dispatched still observe the stop.
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-multi-op-stop",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		State:            state.Task.Running,
+	}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Running},
+		siblingID:   {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Running, EngineResumeContext: "remote-east"},
+	}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: apply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+		operations:      operationStore,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.NoError(t, err)
+
+	assert.Empty(t, server.getStopApplyID(), "no remote stop should be sent for an undispatched operation")
+	assert.Equal(t, state.Task.Stopped, task.State, "the operation's task should be stopped")
+	assert.Equal(t, state.ApplyOperation.Stopped, operationStore.ops[operationID].State, "the claimed operation should be stopped")
+	assert.Equal(t, state.Apply.Running, apply.State, "the parent apply must not be terminalized by one undispatched operation")
+	assert.Equal(t, "remote-east", operationStore.ops[siblingID].EngineResumeContext, "the sibling's remote id must be untouched")
+
+	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, stopReq, "the apply-level stop request must remain pending for sibling operations")
 }
 
 func TestGRPCClient_ResumeApplyOperationRejectsMissingOperationID(t *testing.T) {
@@ -922,6 +1135,9 @@ func TestGRPCClient_ResumeApplyOperationRejectsTasksFromAnotherApply(t *testing.
 			ID:             apply.PlanID,
 			PlanIdentifier: "plan-op-scoped",
 		}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "testdb-deployment", State: state.ApplyOperation.Pending},
+		}},
 	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
@@ -963,6 +1179,9 @@ func TestGRPCClient_ResumeApplyOperationFailsClosedOnNoTasks(t *testing.T) {
 		plans: &mockPlanStore{plan: &storage.Plan{
 			ID:             apply.PlanID,
 			PlanIdentifier: "plan-op-scoped",
+		}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "testdb-deployment", State: state.ApplyOperation.Pending},
 		}},
 	}
 
@@ -2236,7 +2455,46 @@ func TestGRPCClient_QueuedRemoteDispatchPredicate(t *testing.T) {
 				State:      tt.state,
 				ExternalID: tt.externalID,
 			}
-			assert.Equal(t, tt.want, shouldDispatchQueuedRemoteApply(apply))
+			assert.Equal(t, tt.want, shouldDispatchQueuedRemoteApply(apply, wholeApplyTaskScope()))
+		})
+	}
+}
+
+// TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope pins the dispatch
+// gate for multi-operation drives. The operator claim transitions an operation
+// pending→running in a separate transaction before the drive runs, so a freshly
+// claimed operation reaches dispatch in running with no per-operation remote id
+// yet. That first dispatch must proceed — a running operation with an empty
+// remote id is not the ambiguous crash case the whole-apply path rejects.
+func TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope(t *testing.T) {
+	tests := []struct {
+		name     string
+		opState  string
+		remoteID string
+		multiOp  bool
+		want     bool
+	}{
+		{name: "multi-op running without remote id dispatches", opState: state.ApplyOperation.Running, multiOp: true, want: true},
+		{name: "multi-op pending without remote id dispatches", opState: state.ApplyOperation.Pending, multiOp: true, want: true},
+		{name: "multi-op running with remote id does not dispatch", opState: state.ApplyOperation.Running, remoteID: "remote-apply-123", multiOp: true, want: false},
+		{name: "multi-op terminal without remote id does not dispatch", opState: state.ApplyOperation.Completed, multiOp: true, want: false},
+		{name: "single-op running without remote id does not dispatch", opState: state.ApplyOperation.Running, multiOp: false, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The parent apply is running because a sibling deployment is active;
+			// the per-operation remote id (not apply.ExternalID) governs dispatch.
+			apply := &storage.Apply{State: state.Apply.Running}
+			scope := applyTaskScope{
+				applyOperationID: 1,
+				operation: &storage.ApplyOperation{
+					State:               tt.opState,
+					EngineResumeContext: tt.remoteID,
+				},
+				multiOperation: tt.multiOp,
+			}
+			assert.Equal(t, tt.want, shouldDispatchQueuedRemoteApply(apply, scope))
 		})
 	}
 }
@@ -2638,7 +2896,7 @@ func TestGRPCClient_ProcessPendingCutoverWaitsWhenNotReady(t *testing.T) {
 		controlRequests: controlRequests,
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
 	assert.Empty(t, server.getCutoverApplyID())
 	pendingCutover, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
@@ -2682,7 +2940,7 @@ func TestGRPCClient_ProcessPendingCutoverWaitsWhileRecovering(t *testing.T) {
 		controlRequests: controlRequests,
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
 	assert.Empty(t, server.getCutoverApplyID())
 	pendingCutover, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)

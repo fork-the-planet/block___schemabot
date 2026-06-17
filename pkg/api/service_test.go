@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -222,6 +223,61 @@ func TestService_RoutingTernClientRoutesApplyThroughStoredPlanTarget(t *testing.
 	assert.Equal(t, "appdb-target", deploymentClient.applyReq.Target)
 	assert.Equal(t, "staging", deploymentClient.applyReq.Environment)
 	assert.Equal(t, "appdb-target", deploymentClient.applyReq.Options["target"])
+}
+
+// A configured default client (e.g. a TargetRouter) serves any deployment and
+// environment that has no static or registered client, so the operator can
+// resume dynamically-routed applies without a per-deployment registration. A
+// registered client still takes precedence, and without a default the lookup
+// fails closed.
+func TestService_TernClientFallsBackToDefaultClient(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := &mockStorageWithApplyStores{plans: &staticPlanStore{}, applies: &staticApplyStore{}}
+	svc := New(store, &ServerConfig{}, nil, logger)
+
+	// No static config and no default client → fail closed.
+	_, err := svc.TernClient("unconfigured", "staging")
+	require.Error(t, err)
+
+	// Default client serves any deployment/environment otherwise unresolved.
+	def := &mockTernClient{}
+	svc.SetDefaultTernClient(def)
+	got, err := svc.TernClient("unconfigured", "staging")
+	require.NoError(t, err)
+	assert.Same(t, def, got)
+
+	// A registered client takes precedence over the default.
+	registered := &mockTernClient{}
+	svc.RegisterTernClient("primary", "staging", registered)
+	got, err = svc.TernClient("primary", "staging")
+	require.NoError(t, err)
+	assert.Same(t, registered, got)
+}
+
+func TestService_TernClientPrefersConfiguredEndpointOverDefault(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := &mockStorageWithApplyStores{plans: &staticPlanStore{}, applies: &staticApplyStore{}}
+	cfg := &ServerConfig{
+		TernDeployments: TernConfig{
+			"primary":       {"staging": "localhost:9090"},
+			"misconfigured": {"staging": ""}, // present but empty endpoint
+		},
+	}
+	svc := New(store, cfg, nil, logger)
+	svc.SetDefaultTernClient(&mockTernClient{})
+
+	// An explicitly configured gRPC endpoint takes precedence over the default client.
+	got, err := svc.TernClient("primary", "staging")
+	require.NoError(t, err)
+	grpcClient, ok := got.(*tern.GRPCClient)
+	require.True(t, ok, "expected a gRPC client for a configured endpoint, got %T", got)
+	assert.Equal(t, "localhost:9090", grpcClient.Endpoint())
+
+	// A configured-but-misconfigured endpoint fails closed even when a default exists.
+	_, err = svc.TernClient("misconfigured", "staging")
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, errTernDeploymentNotConfigured),
+		"misconfigured endpoint must not be treated as unconfigured")
 }
 
 func TestTernConfig_Endpoint_EmptyEndpoint(t *testing.T) {

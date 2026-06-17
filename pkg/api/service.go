@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -69,6 +70,12 @@ type TernEndpoints map[string]string
 // DefaultDeployment is the deployment key used for single-deployment deployments.
 const DefaultDeployment = "default"
 
+// errTernDeploymentNotConfigured marks an Endpoint lookup that found no entry
+// for the requested deployment/environment, as opposed to an entry that exists
+// but is misconfigured (e.g. an empty endpoint). Callers use it to decide
+// whether a dynamic fallback (a default client) may serve the target.
+var errTernDeploymentNotConfigured = errors.New("tern deployment not configured")
+
 // Endpoint returns the Tern endpoint for the given deployment and environment.
 // For single-deployment deployments, use DefaultDeployment ("default") as the deployment.
 func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
@@ -78,12 +85,12 @@ func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
 
 	endpoints, ok := c[deployment]
 	if !ok {
-		return "", fmt.Errorf("unknown deployment: %s", deployment)
+		return "", fmt.Errorf("unknown deployment %q: %w", deployment, errTernDeploymentNotConfigured)
 	}
 
 	endpoint, ok := endpoints[environment]
 	if !ok {
-		return "", fmt.Errorf("unknown environment %q for deployment %q", environment, deployment)
+		return "", fmt.Errorf("unknown environment %q for deployment %q: %w", environment, deployment, errTernDeploymentNotConfigured)
 	}
 
 	if endpoint == "" {
@@ -108,6 +115,7 @@ type Service struct {
 	storage           storage.Storage
 	config            *ServerConfig
 	ternClients       map[string]tern.Client // keyed by "deployment/environment", lazily created
+	defaultTernClient tern.Client            // fallback for any deployment/environment without a static or gRPC client (e.g. a TargetRouter)
 	routingTernClient *tern.RoutingClient
 	ternMu            sync.Mutex // protects tern client caches and engineFactories
 	logger            *slog.Logger
@@ -332,11 +340,27 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 		}
 	}
 
-	// Fall back to gRPC mode (TernDeployments)
+	// Prefer an explicitly configured gRPC endpoint (TernDeployments) for this
+	// deployment/environment over the dynamic default client.
 	address, err := s.config.TernDeployments.Endpoint(deployment, environment)
 	if err != nil {
-		if deployment == DefaultDeployment {
-			return nil, fmt.Errorf("not found in server configuration")
+		// Only fall back when the target is simply absent from TernDeployments.
+		// An entry that exists but is misconfigured (e.g. an empty endpoint)
+		// must fail closed rather than silently route to the default client.
+		if errors.Is(err, errTernDeploymentNotConfigured) {
+			// A configured default client serves any deployment/environment with
+			// no static local DSN and no configured endpoint — typically a
+			// TargetRouter that resolves the connection from the request's target.
+			// This lets the durable-apply operator resolve dynamically-routed
+			// targets without a per-request RegisterTernClient. It is shared across
+			// keys (the router resolves per request), so it is not cached here.
+			if s.defaultTernClient != nil {
+				s.logger.Debug("using default tern client for dynamic target resolution", "deployment", deployment, "environment", environment)
+				return s.defaultTernClient, nil
+			}
+			if deployment == DefaultDeployment {
+				return nil, fmt.Errorf("not found in server configuration")
+			}
 		}
 		return nil, err
 	}
@@ -401,6 +425,17 @@ func (s *Service) RegisterTernClient(deployment, environment string, client tern
 	s.ternMu.Lock()
 	defer s.ternMu.Unlock()
 	s.ternClients[key] = client
+}
+
+// SetDefaultTernClient sets a fallback tern client used by TernClient for any
+// deployment/environment that has no static local DSN configured. Pass a
+// TargetRouter so the durable-apply operator and routing client resolve the
+// connection from each request's target — the dynamic-resolution counterpart to
+// RegisterTernClient, without needing one registration per deployment.
+func (s *Service) SetDefaultTernClient(client tern.Client) {
+	s.ternMu.Lock()
+	defer s.ternMu.Unlock()
+	s.defaultTernClient = client
 }
 
 // malformedTokenError builds an error for a token that did not parse into a

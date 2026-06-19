@@ -491,6 +491,29 @@ func TestRenderApplyStatusComment_Resuming(t *testing.T) {
 	assert.Contains(t, result, "✓ Complete")
 }
 
+// A cancelled schema change (e.g. a PlanetScale deploy request that was stopped,
+// which is permanent) is terminal: the comment must not offer resume and must
+// tell the operator a new schema change is required.
+func TestRenderApplyStatusComment_Cancelled(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Cancelled,
+		Engine:      "PlanetScale",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "cancelled"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "## 🚫 Schema Change Cancelled")
+	assert.Contains(t, result, "cannot be resumed")
+	assert.Contains(t, result, "Open a new schema change")
+	assert.NotContains(t, result, "schemabot start", "a cancelled change is permanent — no resume affordance")
+}
+
 func TestRenderApplyStatusComment_WaitingForCutover(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
@@ -727,6 +750,14 @@ func TestPreviewCommentApplyResuming(t *testing.T) {
 	assert.NotContains(t, result, "72%")
 }
 
+func TestPreviewCommentApplyCancelled(t *testing.T) {
+	result := PreviewCommentApplyCancelled()
+
+	assert.Contains(t, result, "🚫 Schema Change Cancelled")
+	assert.Contains(t, result, "cannot be resumed")
+	assert.NotContains(t, result, "schemabot start", "a cancelled change is permanent — no resume affordance")
+}
+
 func TestPreviewCommentApplyWaitingForCutover(t *testing.T) {
 	result := PreviewCommentApplyWaitingForCutover()
 
@@ -774,6 +805,39 @@ func TestPreviewCommentSummaryStopped(t *testing.T) {
 	assert.NotContains(t, result, "### ")
 	assert.Contains(t, result, "**`users`** — Stopped at 72%")
 	assert.Contains(t, result, "**`orders`**")
+	// A stopped change is resumable.
+	assert.Contains(t, result, "schemabot start")
+}
+
+func TestPreviewCommentSummaryCancelled(t *testing.T) {
+	result := PreviewCommentSummaryCancelled()
+
+	assert.Contains(t, result, "🚫 Schema Change Cancelled")
+	assert.Contains(t, result, "cannot be resumed")
+	// A cancelled change is permanent — no resume affordance.
+	assert.NotContains(t, result, "schemabot start")
+}
+
+// The terminal summary for a cancelled (permanent) change must not offer resume
+// and must direct the operator to open a new schema change.
+func TestRenderApplySummaryComment_Cancelled(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Cancelled,
+		Engine:      "PlanetScale",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "cancelled"},
+		},
+	}
+
+	result := RenderApplySummaryComment(data)
+
+	assert.Contains(t, result, "## 🚫 Schema Change Cancelled")
+	assert.Contains(t, result, "cannot be resumed")
+	assert.Contains(t, result, "Open a new schema change")
+	assert.NotContains(t, result, "schemabot start", "a cancelled change is permanent — no resume affordance")
 }
 
 func TestPreviewCommentSummaryCompletedLargeSingleNamespaceKeepsApplyIDInsideSection(t *testing.T) {

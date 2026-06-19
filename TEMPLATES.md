@@ -1776,7 +1776,7 @@ Rows: 156,342 / 397,453
 
 ---
 
-To resume:
+Paused — to resume from where it stopped:
 ```
 schemabot start apply-a1b2c3d4e5f6
 ```
@@ -2161,7 +2161,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To resume:
+Paused — to resume from where it stopped:
 ```
 schemabot start apply-a1b2c3d4e5f6
 ```
@@ -2194,6 +2194,39 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="cancelled"></a><strong>Cancelled</strong></summary>
+
+
+## 🚫 Schema Change Cancelled
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+📊 1/2 complete · 1 cancelled
+
+### Table Progress
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: ⊘ Cancelled (not started)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+
+---
+
+This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.
 
 </details>
 
@@ -2448,10 +2481,39 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To resume:
+Paused — to resume from where it stopped:
 ```
 schemabot start apply-a1b2c3d4e5f6
 ```
+
+</details>
+
+<details>
+<summary><a name="summary-cancelled"></a><strong>Summary: Cancelled</strong></summary>
+
+
+## 🚫 Schema Change Cancelled
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 45m
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+1 of 2 tables completed before cancellation.
+
+**`orders`**
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`** — Cancelled
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+
+---
+
+This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.
 
 </details>
 

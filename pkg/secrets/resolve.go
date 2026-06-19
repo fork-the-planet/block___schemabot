@@ -146,11 +146,9 @@ func resolveSecretsManager(ref string) (string, error) {
 		return "", fmt.Errorf("get secret %q: %w", secretName, err)
 	}
 
-	secretValue := ""
-	if result.SecretString != nil {
-		secretValue = *result.SecretString
-	} else {
-		return "", fmt.Errorf("secret %q has no string value (binary secrets not supported)", secretName)
+	secretValue, err := ValueFromGetSecretOutput(result, secretName)
+	if err != nil {
+		return "", err
 	}
 
 	// If no JSON key specified, return the whole secret
@@ -176,4 +174,19 @@ func resolveSecretsManager(ref string) (string, error) {
 	default:
 		return fmt.Sprintf("%v", v), nil
 	}
+}
+
+// ValueFromGetSecretOutput returns a secret's value. Secrets Manager populates
+// exactly one of SecretString or SecretBinary; this prefers the string form and
+// falls back to the binary bytes (already base64-decoded by the SDK), since some
+// secrets — for example a password written via the binary API — have only the
+// binary form. It errors only when neither form is present.
+func ValueFromGetSecretOutput(resp *secretsmanager.GetSecretValueOutput, secretName string) (string, error) {
+	if resp.SecretString != nil {
+		return *resp.SecretString, nil
+	}
+	if resp.SecretBinary != nil {
+		return string(resp.SecretBinary), nil
+	}
+	return "", fmt.Errorf("secret %q has no value", secretName)
 }

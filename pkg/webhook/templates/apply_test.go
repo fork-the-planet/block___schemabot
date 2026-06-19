@@ -463,6 +463,34 @@ func TestRenderApplyStatusComment_Stopped(t *testing.T) {
 	assert.Contains(t, result, "schemabot start")
 }
 
+func TestRenderApplyStatusComment_Resuming(t *testing.T) {
+	// While an apply is resuming, the data plane has not yet reported whether the
+	// change continues from its checkpoint or restarts from scratch, so the row-copy
+	// percent is indeterminate. Non-terminal tables render state-only ("Resuming…")
+	// even though they still carry the pre-stop counters; already-terminal tables
+	// keep their final state.
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Resuming,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "completed"},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "running", RowsCopied: 21000, RowsTotal: 100000, PercentComplete: 21},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "## Schema Change — Resuming")
+	assert.Contains(t, result, "🔄 Resuming…")
+	assert.NotContains(t, result, "21%", "the indeterminate resume window must not show the stale pre-stop percent")
+	assert.NotContains(t, result, "21,000 / 100,000", "the indeterminate resume window must not show stale row counts")
+	// An already-terminal table keeps its final state during resume.
+	assert.Contains(t, result, "✓ Complete")
+}
+
 func TestRenderApplyStatusComment_WaitingForCutover(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
@@ -688,6 +716,15 @@ func TestPreviewCommentApplyStopped(t *testing.T) {
 	assert.Contains(t, result, "Schema Change Stopped")
 	assert.Contains(t, result, "Stopped at 72%")
 	assert.Contains(t, result, "schemabot start")
+}
+
+func TestPreviewCommentApplyResuming(t *testing.T) {
+	result := PreviewCommentApplyResuming()
+
+	assert.Contains(t, result, "Schema Change — Resuming")
+	assert.Contains(t, result, "🔄 Resuming…")
+	// The indeterminate resume window hides the stale pre-stop percent.
+	assert.NotContains(t, result, "72%")
 }
 
 func TestPreviewCommentApplyWaitingForCutover(t *testing.T) {

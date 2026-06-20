@@ -1033,7 +1033,7 @@ func TestOperator_ExpiresRetryableBudget(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{OperatorWorkers: 1}, nil, logger)
+	svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{Drivers: 1}, nil, logger)
 	require.NoError(t, svc.SetOperatorPollInterval(50*time.Millisecond))
 	svc.StartOperator(ctx)
 	defer svc.StopOperator()
@@ -1099,7 +1099,7 @@ func TestOperator_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 	blockingClient1 := newBlockingResumeClient(client1, blockedResume)
 
 	svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{
-		OperatorWorkers: 2,
+		Drivers: 2,
 		Databases: map[string]schemabotapi.DatabaseConfig{
 			db1Name: {
 				Type: "mysql",

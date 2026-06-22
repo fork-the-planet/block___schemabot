@@ -117,13 +117,21 @@ type ServerConfig struct {
 	// Deprecated: use drivers.
 	SchedulerWorkers int `yaml:"scheduler_workers,omitempty"`
 
-	// OperatorClaimOperations switches drivers to claim work at the
+	// OperatorClaimOperations switches operator drivers to claim work at the
 	// apply_operations (per-deployment) level via FindNextApplyOperation instead
-	// of the apply level via FindNextApply. While the apply-create dual-write
-	// produces exactly one operation per apply, the two paths are equivalent;
-	// the operation-level path is the foundation for multi-deployment applies.
-	// Defaults to false (apply-level claiming).
-	OperatorClaimOperations bool `yaml:"operator_claim_operations,omitempty"`
+	// of the apply level via FindNextApply. While every apply still owns exactly
+	// one operation, the operation-scoped drive resolves to the same work as the
+	// apply-scoped drive; the operation-level path is the foundation for
+	// multi-deployment applies.
+	// Defaults to true when not configured (nil = operation-level claiming); set
+	// it to false to claim at the apply level. Read via ShouldClaimOperations.
+	//
+	// Operator note: a deployment that never sets this key claims at the
+	// operation level. This is behavior-preserving while every apply owns one
+	// operation. A data-plane gRPC tern is the exception: it drives applies
+	// inline via LocalClient and does not own the apply_operations lifecycle, so
+	// when this key is unset it defaults to apply-level claiming at startup.
+	OperatorClaimOperations *bool `yaml:"operator_claim_operations,omitempty"`
 
 	// RequirePassingChecks blocks apply when non-SchemaBot PR checks are not
 	// passing. When enabled (default), SchemaBot verifies that all other checks
@@ -1574,6 +1582,18 @@ func (c *ServerConfig) ShouldRequirePassingChecks() bool {
 		return true
 	}
 	return *c.RequirePassingChecks
+}
+
+// ShouldClaimOperations returns true when operator drivers should claim work at
+// the apply_operations (per-deployment) level via FindNextApplyOperation, and
+// false when they should claim at the apply level via FindNextApply. Defaults to
+// true when not configured; set operator_claim_operations to false to claim at
+// the apply level.
+func (c *ServerConfig) ShouldClaimOperations() bool {
+	if c == nil || c.OperatorClaimOperations == nil {
+		return true
+	}
+	return *c.OperatorClaimOperations
 }
 
 // IsCheckRequired returns whether a PR check name is part of the configured

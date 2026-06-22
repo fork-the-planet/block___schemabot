@@ -2,8 +2,10 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"sort"
 	"strconv"
@@ -183,6 +185,13 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 			})
 		}
 		httpResp.Tables = append(httpResp.Tables, tpr)
+	}
+
+	// Carry the engine's display metadata (branch_name, deploy_request_url,
+	// is_instant, deferred_deploy) from the progress projection to the response.
+	if len(resp.Metadata) > 0 {
+		httpResp.Metadata = make(map[string]string, len(resp.Metadata))
+		maps.Copy(httpResp.Metadata, resp.Metadata)
 	}
 
 	return httpResp
@@ -376,11 +385,15 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	s.writeJSON(w, http.StatusOK, httpResp)
 }
 
-// overlayVitessMetadata loads VitessApplyData for the given apply and merges
-// engine-specific metadata (deploy request URL, revert status) into the response.
+// overlayVitessMetadata merges the skip-revert status into the response. The
+// engine's display fields (branch_name, deploy_request_url, is_instant,
+// deferred_deploy) now arrive on the response via the engine's progress
+// projection, so only revert_skipped — core control state, not engine data — is
+// read from storage here. (That field moves off vitess_apply_data in a later
+// change; this overlay disappears with it.)
 func (s *Service) overlayVitessMetadata(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply) {
 	if apply == nil {
-		slog.Warn("progress response will omit vitess metadata: no apply record",
+		slog.Warn("progress response will omit revert status: no apply record",
 			"apply_id", resp.ApplyID,
 			"database", resp.Database,
 			"environment", resp.Environment)
@@ -389,34 +402,81 @@ func (s *Service) overlayVitessMetadata(ctx context.Context, resp *apitypes.Prog
 	if apply.Engine != storage.EnginePlanetScale {
 		return
 	}
-	// The overlay is best-effort enrichment — the progress response is still
-	// served without the engine metadata, so log at Warn rather than Error.
+	// Best-effort enrichment — the progress response is still served without the
+	// revert status, so log at Warn rather than Error.
 	vad, err := s.storage.VitessApplyData().GetByApplyID(ctx, apply.ID)
+	if errors.Is(err, storage.ErrVitessApplyDataNotFound) {
+		// No row yet is expected when skip-revert has not been requested; there
+		// is simply no revert status to overlay. Not an error worth logging.
+		return
+	}
 	if err != nil {
-		slog.Warn("progress response will omit vitess metadata: failed to load vitess apply data",
+		slog.Warn("progress response will omit revert status: failed to load vitess apply data",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"error", err)
 		return
 	}
-	if resp.Metadata == nil {
-		resp.Metadata = make(map[string]string)
-	}
-	if vad.BranchName != "" {
-		resp.Metadata["branch_name"] = vad.BranchName
-	}
-	if vad.DeployRequestURL != "" {
-		resp.Metadata["deploy_request_url"] = vad.DeployRequestURL
-	}
-	if vad.IsInstant {
-		resp.Metadata["is_instant"] = "true"
-	}
-	if vad.DeferredDeploy {
-		resp.Metadata["deferred_deploy"] = "true"
-	}
 	if vad.RevertSkippedAt != nil {
+		if resp.Metadata == nil {
+			resp.Metadata = make(map[string]string)
+		}
 		resp.Metadata["revert_skipped"] = "true"
+	}
+}
+
+// overlayStoredDisplayMetadata populates the PlanetScale display fields
+// (branch_name, deploy_request_url, is_instant, deferred_deploy) on a progress
+// response served from storage. On the live path these arrive from the engine's
+// progress projection; terminal, stopped, and resuming applies are served from
+// storage without polling the engine, so they are read from the durable engine
+// resume state persisted on the apply's operation. Best-effort: a value already
+// set by the caller is never overwritten, and applies that predate resume-state
+// persistence simply render without these fields.
+func (s *Service) overlayStoredDisplayMetadata(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply, operationIDs map[int64]string) {
+	if apply == nil || apply.Engine != storage.EnginePlanetScale {
+		return
+	}
+	for opID := range operationIDs {
+		rs, err := s.storage.ApplyOperations().GetEngineResumeState(ctx, opID)
+		if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
+			// Expected for operations that have not persisted engine state yet
+			// (or predate resume-state persistence) — nothing to overlay.
+			slog.Debug("progress response has no engine resume state to overlay",
+				"apply_id", apply.ApplyIdentifier, "apply_operation_id", opID)
+			continue
+		}
+		if err != nil {
+			slog.Warn("progress response will omit engine display fields: failed to load engine resume state",
+				"apply_id", apply.ApplyIdentifier,
+				"apply_operation_id", opID,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"error", err)
+			continue
+		}
+		display, err := tern.PSDisplayMetadata(rs.Metadata)
+		if err != nil {
+			slog.Warn("progress response will omit engine display fields: failed to decode engine resume state",
+				"apply_id", apply.ApplyIdentifier,
+				"apply_operation_id", opID,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"error", err)
+			continue
+		}
+		if len(display) == 0 {
+			continue
+		}
+		if resp.Metadata == nil {
+			resp.Metadata = make(map[string]string, len(display))
+		}
+		for k, v := range display {
+			if resp.Metadata[k] == "" {
+				resp.Metadata[k] = v
+			}
+		}
 	}
 }
 
@@ -807,6 +867,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	s.overlayVitessMetadata(ctx, httpResp, apply)
 	operations, deploymentByOperationID := s.bestEffortProgressOperations(ctx, apply)
 	httpResp.Operations = operations
+	s.overlayStoredDisplayMetadata(ctx, httpResp, apply, deploymentByOperationID)
 
 	for _, task := range tasks {
 		tpr := &apitypes.TableProgressResponse{

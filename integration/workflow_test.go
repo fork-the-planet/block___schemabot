@@ -4,6 +4,7 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -166,6 +167,30 @@ func postJSON(t *testing.T, url string, body any) map[string]any {
 
 	var result map[string]any
 	require.NoError(t, json.Unmarshal(respBody, &result), "decode response")
+	return result
+}
+
+// getProgress GETs the progress endpoint and returns the decoded JSON response.
+// Each request carries its own timeout so a stalled server fails the request
+// instead of hanging the caller's polling loop past its deadline.
+func getProgress(t *testing.T, ctx context.Context, url string) map[string]any {
+	t.Helper()
+
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	require.NoError(t, err, "create progress request")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	require.NoError(t, err, "GET %s", url)
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	require.Equalf(t, http.StatusOK, resp.StatusCode, "GET %s: %s", url, string(respBody))
+
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(respBody, &result), "decode progress response")
 	return result
 }
 
@@ -998,14 +1023,7 @@ func TestFullWorkflow_Spirit_DDLWithProgress(t *testing.T) {
 		seenStates := make(map[string]bool)
 		completed := false
 		for time.Now().Before(deadline) {
-			progressHTTPReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/api/progress/apply/"+applyID, nil)
-			require.NoError(t, err, "create progress request")
-			resp, err := http.DefaultClient.Do(progressHTTPReq)
-			require.NoError(t, err, "GET /api/progress error")
-
-			var progressResp map[string]any
-			_ = json.NewDecoder(resp.Body).Decode(&progressResp)
-			_ = resp.Body.Close()
+			progressResp := getProgress(t, ctx, endpoint+"/api/progress/apply/"+applyID)
 
 			progState, _ := progressResp["state"].(string)
 			if !seenStates[progState] {
@@ -1284,41 +1302,37 @@ CREATE TABLE orders (
 	applyID, ok := applyResp["apply_id"].(string)
 	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResp)
 
-	// Step 3: Poll progress until we see failed state
+	// Step 3: Poll progress until the MySQL error is surfaced in
+	// Progress.ErrorMessage. A Spirit DDL error is retryable by default, so the
+	// apply repeatedly cycles failed_retryable → running as the operator
+	// re-dispatches it, and reaches terminal failed only once the retry budget
+	// is exhausted. The error is surfaced whenever the apply is in a failure
+	// state, so poll on a bounded deadline until it appears rather than racing
+	// the narrow failed_retryable windows.
+	deadline := time.Now().Add(20 * time.Second)
 	var lastState string
 	var errorMessage string
-	for range 30 {
-		progressHTTPReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/api/progress/apply/"+applyID, nil)
-		require.NoError(t, err, "create progress request")
-		resp, err := http.DefaultClient.Do(progressHTTPReq)
-		require.NoError(t, err, "GET /api/progress error")
-
-		var progressResp map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&progressResp); err != nil {
-			_ = resp.Body.Close()
-			require.NoError(t, err, "decode progress response")
-		}
-		_ = resp.Body.Close()
+	for time.Now().Before(deadline) {
+		progressResp := getProgress(t, ctx, endpoint+"/api/progress/apply/"+applyID)
 
 		lastState, _ = progressResp["state"].(string)
-		if msg, ok := progressResp["error_message"].(string); ok {
+		if msg, ok := progressResp["error_message"].(string); ok && msg != "" {
 			errorMessage = msg
 		}
 
 		t.Logf("Progress state: %s, error: %s", lastState, errorMessage)
 
-		if lastState == state.Apply.Failed {
+		if errorMessage != "" {
 			break
 		}
 		if lastState == state.Apply.Completed {
-			require.Fail(t, "expected failed but got completed")
+			require.Fail(t, "expected failure but got completed")
 		}
 
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	// Verify we got failed state with error message
-	assert.Equal(t, state.Apply.Failed, lastState)
+	// Verify the MySQL error was surfaced in Progress.ErrorMessage.
 	assert.NotEmpty(t, errorMessage, "expected error_message to be set")
 	// MySQL error for FK to non-existent table should mention "users" or "referenced"
 	lowerErr := strings.ToLower(errorMessage)
@@ -1403,17 +1417,7 @@ CREATE TABLE ccc_cancelled (
 	var errorMessage string
 	var finalTables []any
 	for range 60 {
-		progressHTTPReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/api/progress/apply/"+applyID, nil)
-		require.NoError(t, err, "create progress request")
-		resp, err := http.DefaultClient.Do(progressHTTPReq)
-		require.NoError(t, err, "GET /api/progress error")
-
-		var progressResp map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&progressResp); err != nil {
-			_ = resp.Body.Close()
-			require.NoError(t, err, "decode progress response")
-		}
-		_ = resp.Body.Close()
+		progressResp := getProgress(t, ctx, endpoint+"/api/progress/apply/"+applyID)
 
 		lastState, _ = progressResp["state"].(string)
 		if msg, ok := progressResp["error_message"].(string); ok {

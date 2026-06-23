@@ -16,6 +16,7 @@ import (
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -207,6 +208,108 @@ func failedApplyState(s string) bool {
 	return state.IsState(s, state.Apply.Failed) || state.IsState(s, state.Apply.FailedRetryable)
 }
 
+// multiDeployTernStorageDSN returns the DSN for one deployment's Tern storage
+// database (the `tern` schema on that deployment's MySQL instance, alongside
+// the `testapp` target schema).
+func multiDeployTernStorageDSN(t *testing.T, deployment string) string {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(multiDeployTernMySQLDSN(t, deployment))
+	require.NoErrorf(t, err, "parse tern dsn (%s)", deployment)
+	cfg.DBName = "tern"
+	return cfg.FormatDSN()
+}
+
+// multiDeployClearTernStorage clears every deployment's Tern storage so the
+// next test starts clean. Unlike the single-deployment helper, the fan-out
+// stack keeps one Tern storage DB per deployment instance, so a sibling's rows
+// would otherwise linger and keep its operation active.
+func multiDeployClearTernStorage(t *testing.T, deployments ...string) {
+	t.Helper()
+	for _, d := range deployments {
+		db, err := sql.Open("mysql", multiDeployTernStorageDSN(t, d))
+		require.NoErrorf(t, err, "cleanup: open tern storage db (%s)", d)
+		func() {
+			defer utils.CloseAndLog(db)
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+			defer cancel()
+
+			// sql.Open is lazy and rarely validates the DSN or connectivity, so
+			// ping before issuing cleanup queries: a silently skipped cleanup
+			// leaves a sibling's Tern rows behind and makes later tests flaky.
+			require.NoErrorf(t, db.PingContext(ctx), "cleanup: ping tern storage db (%s)", d)
+
+			rows, err := db.QueryContext(ctx, "SHOW TABLES")
+			if err != nil {
+				t.Logf("cleanup: show tables on tern storage (%s): %v", d, err)
+				return
+			}
+			var tables []string
+			for rows.Next() {
+				var table string
+				if err := rows.Scan(&table); err != nil {
+					t.Logf("cleanup: scan tern table name (%s): %v", d, err)
+					break
+				}
+				tables = append(tables, table)
+			}
+			rowsErr := rows.Err()
+			utils.CloseAndLog(rows)
+			if rowsErr != nil {
+				t.Logf("cleanup: iterate tern tables (%s): %v", d, rowsErr)
+				return
+			}
+			for _, table := range tables {
+				if _, err := db.ExecContext(ctx, "DELETE FROM `"+table+"`"); err != nil {
+					t.Logf("cleanup: clear tern table %s (%s): %v", table, d, err)
+				}
+			}
+		}()
+	}
+}
+
+// multiDeployEnsureNoActiveChange clears any active schema change for the
+// fan-out (database, env). It mirrors grpcEnsureNoActiveChange but clears Tern
+// storage on every deployment instance, since the fan-out keeps a separate Tern
+// storage DB per deployment.
+func multiDeployEnsureNoActiveChange(t *testing.T, database, env string, deployments ...string) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Minute)
+	for time.Now().Before(deadline) {
+		active := grpcFindLatestApplyForDatabase(t, database, env)
+
+		// Terminal applies, including failed applies, do not hold active locks,
+		// so clear storage directly rather than reverting.
+		if active == nil || state.IsTerminalApplyState(active.State) ||
+			state.IsState(active.State, state.Apply.RevertWindow, state.Apply.Reverted) {
+			multiDeployClearTernStorage(t, deployments...)
+			grpcClearSchemabotState(t)
+			return
+		}
+
+		if state.IsState(active.State, state.Apply.FailedRetryable) {
+			multiDeployClearTernStorage(t, deployments...)
+			grpcClearSchemabotState(t)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		// Parked at the cutover barrier from a prior test — release it.
+		if state.IsState(active.State, state.Apply.WaitingForCutover) {
+			resp := grpcPost(t, "/api/cutover", map[string]string{
+				"environment": env,
+				"apply_id":    active.ApplyID,
+			})
+			_ = resp.Body.Close()
+			time.Sleep(time.Second)
+			continue
+		}
+
+		time.Sleep(time.Second)
+	}
+	require.Fail(t, "could not ensure no active schema change within deadline")
+}
+
 // TestGRPCMultiDeploy_OrderedCutover verifies that a single fan-out apply over
 // two deployments honours barrier-policy ordered cutover.
 //
@@ -238,7 +341,7 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 			"CONCAT('user_', seq), REPEAT('x', 200)", 10000)
 	}
 
-	grpcEnsureNoActiveChange(t, database, env)
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 
 	// Widen the primary key from INT to BIGINT to force a full table copy on
 	// every deployment.
@@ -306,7 +409,7 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 		"expected %s (completed %s) to cut over no earlier than %s (completed %s)",
 		second, final[second].CompletedAt, first, final[first].CompletedAt)
 
-	grpcEnsureNoActiveChange(t, database, env)
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 }
 
 // TestGRPCMultiDeploy_FailureHaltsRollout verifies that a deployment failure
@@ -340,7 +443,7 @@ func TestGRPCMultiDeploy_FailureHaltsRollout(t *testing.T) {
 	multiDeploySeedRows(t, first, tableName, "name, data", "'dup', REPEAT('x', 200)", 10000)
 	multiDeploySeedRows(t, second, tableName, "name, data", "CONCAT('user_', seq), REPEAT('x', 200)", 10000)
 
-	grpcEnsureNoActiveChange(t, database, env)
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 
 	// Add a UNIQUE index on name; the earlier deployment's duplicate data makes
 	// its copy fail.
@@ -380,5 +483,78 @@ func TestGRPCMultiDeploy_FailureHaltsRollout(t *testing.T) {
 	prog := grpcProgressByApplyID(t, apply.ApplyID)
 	assert.Truef(t, failedApplyState(prog.State), "aggregate apply state should be failed, was %q", prog.State)
 
-	grpcEnsureNoActiveChange(t, database, env)
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+}
+
+// TestGRPCMultiDeploy_OnFailureContinue verifies that `on_failure: continue`
+// lets a barrier-policy fan-out finish healthy deployments despite a sibling
+// failure.
+//
+// Scenario: testapp/production-continue fans out to [eu, us] with
+// deployment_order [eu, us], cutover_policy: barrier, and on_failure: continue.
+// The earlier deployment (eu) is seeded with duplicate data so adding a UNIQUE
+// key fails its copy; the later deployment (us) is healthy. Because the policy
+// is continue, eu's failure is treated as settled rather than halting the
+// rollout: us still cuts over and reaches completed. The apply itself settles
+// to failed — continue governs rollout continuation, not the pass/fail verdict.
+func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
+	requireMultiDeploy(t)
+
+	const (
+		database = "testapp"
+		env      = "production-continue"
+	)
+	// Matches deployment_order in grpc-schemabot-multideploy.yaml.
+	first, second := "eu", "us"
+
+	tableName := uniqueGRPCTableName("md_continue")
+	createDDL := fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)", tableName)
+	for _, d := range []string{first, second} {
+		multiDeployCreateTestTable(t, d, tableName, createDDL)
+	}
+	// The earlier deployment gets identical names so adding UNIQUE(name) fails
+	// during its copy; the later deployment gets unique names so it completes.
+	multiDeploySeedRows(t, first, tableName, "name, data", "'dup', REPEAT('x', 200)", 10000)
+	multiDeploySeedRows(t, second, tableName, "name, data", "CONCAT('user_', seq), REPEAT('x', 200)", 10000)
+
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+
+	plan := grpcPlan(t, database, env, map[string]string{
+		tableName + ".sql": fmt.Sprintf(
+			"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT, UNIQUE KEY uniq_name (name));", tableName),
+	})
+	require.Empty(t, plan.Errors, "plan errors: %v", plan.Errors)
+	require.NotEmpty(t, plan.PlanID, "plan_id")
+
+	apply := grpcApply(t, plan.PlanID, env, nil)
+	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
+
+	// Wait until both deployments are terminal: the earlier failed, the later
+	// completed. Under continue, the later sibling must not be blocked by the
+	// earlier failure.
+	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			return failedApplyState(ops[first].State) &&
+				state.IsState(ops[second].State, state.Apply.Completed)
+		},
+		func() string {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			return fmt.Sprintf("waiting for %s failed + %s completed; %s=%q %s=%q",
+				first, second, first, ops[first].State, second, ops[second].State)
+		},
+	)
+
+	final := multiDeployOps(t, apply.ApplyID, first, second)
+	assert.Truef(t, failedApplyState(final[first].State), "%s should be failed, was %q", first, final[first].State)
+	assert.Truef(t, state.IsState(final[second].State, state.Apply.Completed),
+		"%s should complete under on_failure: continue, was %q", second, final[second].State)
+
+	// The apply settles to failed even though a sibling completed — continue
+	// governs rollout continuation, not the verdict.
+	prog := grpcProgressByApplyID(t, apply.ApplyID)
+	assert.Truef(t, failedApplyState(prog.State), "aggregate apply state should be failed, was %q", prog.State)
+
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 }

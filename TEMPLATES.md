@@ -2238,6 +2238,8 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
+🔗 **Deploy request**: https://app.planetscale.com/acme/myapp/deploy-requests/42
+
 ### Table Progress
 
 **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
@@ -3466,7 +3468,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:     myapp                     │
 │  Environment:  staging                   │
 │  State:        Refreshing branch schema  │
-│  Branch:       my-reusable-branch        │
 └──────────────────────────────────────────┘
 
 
@@ -3483,7 +3484,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:     myapp                                      │
 │  Environment:  staging                                    │
 │  State:        Applied keyspace myapp_sharded_003 (8/12)  │
-│  Branch:       schemabot-myapp-28471035                   │
 └───────────────────────────────────────────────────────────┘
 
 
@@ -3495,13 +3495,12 @@ Use 'schemabot start' to resume from checkpoint.
 
 ```
 
-┌──────────────────────────────────────────┐
-│  Apply ID:     apply-a1b2c3d4e5f6        │
-│  Database:     myapp                     │
-│  Environment:  staging                   │
-│  State:        Validating branch         │
-│  Branch:       schemabot-myapp-28471035  │
-└──────────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6  │
+│  Database:     myapp               │
+│  Environment:  staging             │
+│  State:        Validating branch   │
+└────────────────────────────────────┘
 
 
 ```
@@ -3512,13 +3511,12 @@ Use 'schemabot start' to resume from checkpoint.
 
 ```
 
-┌──────────────────────────────────────────┐
-│  Apply ID:     apply-a1b2c3d4e5f6        │
-│  Database:     myapp                     │
-│  Environment:  staging                   │
-│  State:        Creating deploy request   │
-│  Branch:       schemabot-myapp-28471035  │
-└──────────────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6       │
+│  Database:     myapp                    │
+│  Environment:  staging                  │
+│  State:        Creating deploy request  │
+└─────────────────────────────────────────┘
 
 
 ```
@@ -3534,7 +3532,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Validating deploy request                                    │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
 └────────────────────────────────────────────────────────────────────────────────┘
 
@@ -3578,7 +3575,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
 │  Started:         Jan 15 14:29:30 UTC                                          │
 │  Duration:        30s                                                          │
@@ -3604,7 +3600,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Completed                                                    │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
 │  Started:         Jan 15 14:28:30 UTC                                          │
 │  Duration:        1m 30s                                                       │
@@ -3630,7 +3625,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:        commerce                                                        │
 │  Environment:     production                                                      │
 │  State:           Completed                                                       │
-│  Branch:          schemabot-commerce-72511904                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/commerce/deploy-requests/86  │
 │  Started:         Jan 15 14:28:00 UTC                                             │
 │  Duration:        2m                                                              │
@@ -3663,7 +3657,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Failed                                                       │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
 │  Started:         Jan 15 14:29:00 UTC                                          │
 │  Duration:        1m                                                           │
@@ -3696,7 +3689,6 @@ The new apply will only process tables that haven't completed.
 │  Environment:     production                                                   │
 │  State:           Waiting for deploy                                           │
 │  Options:         ⏸️ Defer Deploy                                              │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/50  │
 │  Started:         Jan 15 14:29:30 UTC                                          │
 │  Duration:        30s                                                          │
@@ -3722,7 +3714,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Environment:     production                                                   │
 │  State:           Waiting for cutover                                          │
 │  Options:         ⏸️ Defer Cutover                                             │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/49  │
 │  Started:         Jan 15 14:27:00 UTC                                          │
 │  Duration:        3m                                                           │
@@ -3752,7 +3743,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Environment:     production                                                   │
 │  State:           Cutting over                                                 │
 │  Options:         ⏸️ Defer Cutover                                             │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/49  │
 │  Started:         Jan 15 14:26:00 UTC                                          │
 │  Duration:        4m                                                           │
@@ -3781,7 +3771,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Cancelled                                                    │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/50  │
 │  Started:         Jan 15 14:28:00 UTC                                          │
 │  Duration:        2m                                                           │
@@ -3810,7 +3799,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        commerce                                                        │
 │  Environment:     production                                                      │
 │  State:           Running                                                         │
-│  Branch:          schemabot-commerce-99182746                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/commerce/deploy-requests/28  │
 │  Started:         Jan 15 14:18:00 UTC                                             │
 │  Duration:        12m                                                             │
@@ -3847,7 +3835,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        commerce                                                        │
 │  Environment:     production                                                      │
 │  State:           Running                                                         │
-│  Branch:          schemabot-commerce-99182746                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/commerce/deploy-requests/29  │
 │  Started:         Jan 15 14:22:00 UTC                                             │
 │  Duration:        8m                                                              │
@@ -3916,7 +3903,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/43  │
 │  Started:         Jan 15 14:29:50 UTC                                          │
 │  Duration:        10s                                                          │
@@ -3939,7 +3925,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/46  │
 │  Started:         Jan 15 14:29:50 UTC                                          │
 │  Duration:        10s                                                          │
@@ -3964,7 +3949,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/44  │
 │  Started:         Jan 15 14:29:40 UTC                                          │
 │  Duration:        20s                                                          │
@@ -4001,7 +3985,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/45  │
 │  Started:         Jan 15 14:29:30 UTC                                          │
 │  Duration:        30s                                                          │
@@ -4030,7 +4013,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/46  │
 │  Started:         Jan 15 14:29:15 UTC                                          │
 │  Duration:        45s                                                          │
@@ -4059,7 +4041,6 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Database:        myapp                                                        │
 │  Environment:     production                                                   │
 │  State:           Running                                                      │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/51  │
 │  Started:         Jan 15 14:25:00 UTC                                          │
 │  Duration:        5m                                                           │
@@ -4238,7 +4219,6 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 │  Database:        myapp                                                        │
 │  Environment:     staging                                                      │
 │  State:           Completed                                                    │
-│  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/47  │
 │  Started:         Jan 15 14:29:57 UTC                                          │
 │  Duration:        3s                                                           │
@@ -4264,7 +4244,6 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 │  Database:           myapp                                                        │
 │  Environment:        production                                                   │
 │  State:              Revert window                                                │
-│  Branch:             schemabot-myapp-28471035                                     │
 │  Deploy Request:     https://app.planetscale.com/my-org/myapp/deploy-requests/48  │
 │  Started:            Jan 15 14:28:00 UTC                                          │
 │  Duration:           30s                                                          │

@@ -175,6 +175,63 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "Queued")
 }
 
+// A Vitess apply surfaces each keyspace's VSchema application status (and diff)
+// from engine display metadata as a dedicated section, so the PR comment shows
+// VSchema progress the same way the CLI does — including a multi-keyspace apply
+// where each keyspace tracks independently, and a VSchema-only apply with no
+// per-table tasks at all.
+func TestRenderApplyStatusComment_VSchema(t *testing.T) {
+	t.Run("populated from progress metadata", func(t *testing.T) {
+		changesJSON, err := apitypes.EncodeVSchemaChanges([]apitypes.VSchemaChange{
+			{Namespace: "commerce", Status: "applied", Diff: `+ "lookup": {}`},
+			{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {}`},
+		})
+		require.NoError(t, err)
+
+		data := ApplyStatusFromProgress(&apitypes.ProgressResponse{
+			Database:    "testapp",
+			Environment: "staging",
+			State:       "running",
+			Engine:      "PlanetScale",
+			Metadata:    map[string]string{apitypes.VSchemaChangesMetadataKey: changesJSON},
+		}, "aparajon")
+
+		require.Len(t, data.VSchemaChanges, 2)
+		assert.Equal(t, "commerce", data.VSchemaChanges[0].Namespace)
+		assert.Equal(t, "applied", data.VSchemaChanges[0].Status)
+		assert.Equal(t, "commerce_sharded", data.VSchemaChanges[1].Namespace)
+		assert.Equal(t, "applying", data.VSchemaChanges[1].Status)
+	})
+
+	t.Run("renders a VSchema section per keyspace with status and diff", func(t *testing.T) {
+		data := ApplyStatusCommentData{
+			Database: "testapp", Environment: "staging", RequestedBy: "aparajon",
+			State: "running", Engine: "PlanetScale",
+			VSchemaChanges: []apitypes.VSchemaChange{
+				{Namespace: "commerce", Status: "applied", Diff: `+ "lookup": {}`},
+				{Namespace: "commerce_sharded", Status: "applying", Diff: `+ "xxhash": {"type": "xxhash"}`},
+			},
+		}
+
+		result := RenderApplyStatusComment(data)
+
+		assert.Contains(t, result, "### VSchema")
+		assert.Contains(t, result, "**`commerce`**: Applied")
+		assert.Contains(t, result, "**`commerce_sharded`**: Applying...")
+		assert.Contains(t, result, "```diff")
+		assert.Contains(t, result, `+ "xxhash": {"type": "xxhash"}`)
+	})
+
+	t.Run("no VSchema change renders no section", func(t *testing.T) {
+		data := ApplyStatusCommentData{
+			Database: "testapp", Environment: "staging", State: "running", Engine: "Spirit",
+			Tables: []TableProgressData{{TableName: "users", Status: "running"}},
+		}
+
+		assert.NotContains(t, RenderApplyStatusComment(data), "### VSchema")
+	})
+}
+
 // A PlanetScale apply in a deploy-request phase renders its first-class phase
 // header (not a generic "In Progress") and still offers the operator a stop
 // action — the change is active, stoppable work before cutover.
@@ -859,6 +916,29 @@ func TestRenderApplySummaryComment_Cancelled(t *testing.T) {
 	assert.Contains(t, result, "cannot be resumed")
 	assert.Contains(t, result, "Open a new schema change")
 	assert.NotContains(t, result, "schemabot start", "a cancelled change is permanent — no resume affordance")
+}
+
+// A VSchema-only apply completes with no per-table tasks, so the terminal
+// summary reports the VSchema outcome instead of an inaccurate "All 0 tables
+// applied" message, and still records which keyspaces were applied.
+func TestRenderApplySummaryComment_VSchemaOnly(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Completed,
+		Engine:      "PlanetScale",
+		VSchemaChanges: []apitypes.VSchemaChange{
+			{Namespace: "commerce_sharded", Status: "applied", Diff: `+ "xxhash": {"type": "xxhash"}`},
+		},
+	}
+
+	result := RenderApplySummaryComment(data)
+
+	assert.NotContains(t, result, "0 tables")
+	assert.Contains(t, result, "VSchema applied successfully")
+	assert.Contains(t, result, "### VSchema")
+	assert.Contains(t, result, "**`commerce_sharded`**: Applied")
 }
 
 func TestPreviewCommentSummaryCompletedLargeSingleNamespaceKeepsApplyIDInsideSection(t *testing.T) {

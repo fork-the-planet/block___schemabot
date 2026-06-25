@@ -2044,6 +2044,111 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 </details>
 
 <details>
+<summary><a name="vitess-vschema-only"></a><strong>Vitess: VSchema Only</strong></summary>
+
+
+## Schema Change In Progress
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### VSchema
+
+**`myapp_sharded`**: Applying...
+
+```diff
++ "xxhash": {"type": "xxhash"}
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="vitess-ddl--vschema"></a><strong>Vitess: DDL + VSchema</strong></summary>
+
+
+## Schema Change In Progress
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### Table Progress
+
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+```
+
+
+### VSchema
+
+**`myapp_sharded`**: Applying...
+
+```diff
++ "xxhash": {"type": "xxhash"}
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="vitess-multikeyspace-vschema"></a><strong>Vitess: Multi-keyspace VSchema</strong></summary>
+
+
+## Schema Change In Progress
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### VSchema
+
+**`commerce`**: Applied
+
+```diff
++ "lookup_orders": {"type": "lookup_hash"}
+```
+
+**`commerce_sharded`**: Applying...
+
+```diff
++ "xxhash": {"type": "xxhash"}
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="first-table-failed"></a><strong>First Table Failed</strong></summary>
 
 
@@ -3613,7 +3718,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 </details>
 
 <details>
-<summary><a name="vitess-vschemaonly-update"></a><strong>Vitess: Vschema-only Update</strong></summary>
+<summary><a name="vitess-vschema-only-update"></a><strong>Vitess: VSchema Only Update</strong></summary>
 
 ```
 
@@ -3628,10 +3733,32 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  Duration:        10s                                                          │
 └────────────────────────────────────────────────────────────────────────────────┘
 
+    ~ VSchema (myapp_sharded): Applying...
+       + "xxhash": {"type": "xxhash"}
 
-  ── myapp_sharded ──
 
-    ~ VSchema: Applying...
+```
+</details>
+
+<details>
+<summary><a name="vitess-multikeyspace-vschema"></a><strong>Vitess: Multi-keyspace VSchema</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Running                                                      │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/46  │
+│  Started:         Jan 15 14:29:50 UTC                                          │
+│  Duration:        10s                                                          │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+    ~ VSchema (commerce): Applied
+       + "lookup_orders": {"type": "lookup_hash"}
+    ~ VSchema (commerce_sharded): Applying...
        + "xxhash": {"type": "xxhash"}
 
 
@@ -3694,16 +3821,11 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── myapp_sharded ──
 
-    ~ VSchema: Applying...
-       + "xxhash": {"type": "xxhash"}
-
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
-
-  ── myapp ──
-
-    ~ VSchema: Applied
+    ~ VSchema (myapp_sharded): Applying...
+       + "xxhash": {"type": "xxhash"}
 
 
 ```
@@ -3821,7 +3943,7 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
 </details>
 
 <details>
-<summary><a name="vitess-plan-vschemaonly"></a><strong>Vitess: Plan (Vschema-only)</strong></summary>
+<summary><a name="vitess-plan-vschema-only"></a><strong>Vitess: Plan (VSchema Only)</strong></summary>
 
 ```
 

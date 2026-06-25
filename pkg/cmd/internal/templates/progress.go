@@ -2,12 +2,14 @@ package templates
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/block/spirit/pkg/statement"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -195,12 +197,12 @@ func WriteProgress(data ProgressData) {
 		}
 	}
 
-	// Surface VSchema application status (and diff) from the engine's display
-	// metadata, rather than from a synthetic task in the table list.
-	if data.Metadata != nil {
-		if vs := FormatVSchemaStatus(data.Metadata["vschema_status"], data.Metadata["vschema_diff"]); vs != "" {
-			fmt.Print(vs)
-		}
+	// Surface per-keyspace VSchema application status (and diff) from the engine's
+	// display metadata, rather than from a synthetic task in the table list.
+	if changes, err := apitypes.ParseVSchemaChanges(data.Metadata); err != nil {
+		slog.Warn("failed to parse VSchema changes from progress metadata", "error", err)
+	} else if vs := FormatVSchemaStatus(changes); vs != "" {
+		fmt.Print(vs)
 	}
 
 	// Show deploy request info for deferred deploys
@@ -251,14 +253,6 @@ func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, act
 		ns := t.Namespace
 		if ns == "" {
 			ns = "(default)"
-		}
-		// Strip namespace prefix from VSchema task names (e.g., "VSchema: myapp_sharded" -> "VSchema")
-		// since the keyspace header already provides context.
-		if strings.HasPrefix(t.TableName, "vschema:") || strings.HasPrefix(t.TableName, "VSchema:") {
-			parts := strings.SplitN(t.TableName, ": ", 2)
-			if len(parts) == 2 {
-				t.TableName = "VSchema"
-			}
 		}
 		if idx, ok := nsIndex[ns]; ok {
 			ordered[idx].tables = append(ordered[idx].tables, t)
@@ -321,36 +315,23 @@ func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, act
 	return b.String()
 }
 
-// FormatVSchemaStatus renders the VSchema-application status and diff surfaced
-// on a progress response's display metadata (vschema_status / vschema_diff).
-// Returns empty when the deploy carries no VSchema change. The diff field is a
-// VSchema diff (not SQL), rendered with diff coloring via colorizeDiffLine.
-func FormatVSchemaStatus(status, diff string) string {
-	if status == "" && diff == "" {
+// FormatVSchemaStatus renders each keyspace's VSchema-application status and
+// diff surfaced on a progress response's display metadata. Returns empty when
+// the apply carries no VSchema change. A keyspace's diff is a VSchema diff (not
+// SQL), rendered with diff coloring via colorizeDiffLine.
+func FormatVSchemaStatus(changes []apitypes.VSchemaChange) string {
+	if len(changes) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "    ~ VSchema: %s\n", vschemaMetadataStatusLabel(status))
-	if diff != "" {
-		b.WriteString(FormatVSchemaDiff(diff, indentContent))
+	for _, c := range changes {
+		fmt.Fprintf(&b, "    ~ VSchema (%s): %s\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
+		if c.Diff != "" {
+			b.WriteString(FormatVSchemaDiff(c.Diff, indentContent))
+		}
 	}
 	b.WriteString("\n")
 	return b.String()
-}
-
-// vschemaMetadataStatusLabel maps the engine's vschema_status display value to a
-// human label.
-func vschemaMetadataStatusLabel(status string) string {
-	switch status {
-	case "applying":
-		return "Applying..."
-	case "applied":
-		return "Applied"
-	case "":
-		return "Pending"
-	default:
-		return status
-	}
 }
 
 // FormatVSchemaDiff returns a VSchema diff with colorized +/- lines as a string,

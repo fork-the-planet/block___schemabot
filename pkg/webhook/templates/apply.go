@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -43,6 +44,11 @@ type ApplyStatusCommentData struct {
 	StartedAt    string // RFC3339 format
 	CompletedAt  string // RFC3339 format
 	Tables       []TableProgressData
+
+	// VSchemaChanges holds per-keyspace VSchema application state, surfaced from
+	// the engine's display metadata rather than as a per-table task. Empty when
+	// the apply carries no VSchema change.
+	VSchemaChanges []apitypes.VSchemaChange
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -70,6 +76,10 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	if len(data.Tables) > 0 {
 		writeTableProgressSection(&sb, data)
 	}
+
+	// VSchema application status, surfaced from engine metadata rather than as a
+	// per-table task (a VSchema-only apply has no tables at all).
+	writeVSchemaStatus(&sb, data)
 
 	// Error message for apply states that need operator triage.
 	if state.IsState(data.State, state.Apply.Failed, state.Apply.Stopped) && data.ErrorMessage != "" {
@@ -312,6 +322,23 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 
 	if len(parts) > 0 {
 		fmt.Fprintf(sb, "\n📊 %s\n", strings.Join(parts, " · "))
+	}
+}
+
+// writeVSchemaStatus renders the VSchema application status and diff surfaced
+// from the engine's display metadata. It is shown as its own section because
+// VSchema application is not a per-table task. Renders nothing when the apply
+// carries no VSchema change.
+func writeVSchemaStatus(sb *strings.Builder, data ApplyStatusCommentData) {
+	if len(data.VSchemaChanges) == 0 {
+		return
+	}
+	sb.WriteString("\n### VSchema\n\n")
+	for _, c := range data.VSchemaChanges {
+		fmt.Fprintf(sb, "**`%s`**: %s\n\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
+		if c.Diff != "" {
+			fmt.Fprintf(sb, "```diff\n%s\n```\n\n", c.Diff)
+		}
 	}
 }
 
@@ -620,13 +647,20 @@ func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, tot
 	writeApplyHeader(sb, data)
 	writeSummaryCompletedMetadata(sb, data)
 	var msg string
-	if totalTables == 1 {
+	switch {
+	case totalTables == 0 && len(data.VSchemaChanges) > 0:
+		// VSchema-only apply: no per-table tasks, so report the VSchema outcome.
+		msg = "VSchema applied successfully — your changes are live!"
+	case totalTables == 0:
 		msg = "Schema change applied successfully — your changes are live!"
-	} else {
+	case totalTables == 1:
+		msg = "Schema change applied successfully — your changes are live!"
+	default:
 		msg = fmt.Sprintf("All %d tables applied successfully — your schema changes are live!", totalTables)
 	}
 	writeSuccessBlock(sb, msg)
 	writeSummaryTableList(sb, data)
+	writeVSchemaStatus(sb, data)
 	if data.ApplyID != "" {
 		if !strings.HasSuffix(sb.String(), "\n\n") {
 			sb.WriteString("\n")
@@ -926,6 +960,12 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		ErrorMessage: resp.ErrorMessage,
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
+	}
+
+	if changes, err := apitypes.ParseVSchemaChanges(resp.Metadata); err != nil {
+		slog.Warn("failed to parse VSchema changes from progress metadata", "apply_id", resp.ApplyID, "error", err)
+	} else {
+		data.VSchemaChanges = changes
 	}
 
 	for _, t := range resp.Tables {

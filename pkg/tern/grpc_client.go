@@ -97,11 +97,15 @@ package tern
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -1069,6 +1073,32 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 	}, nil
 }
 
+// remoteApplyIdempotencyKey derives the deduplication key the control plane
+// stamps on every remote Apply dispatch. The key is stable across a re-dispatch
+// of the same generation — so an ambiguous dispatch whose response was lost is
+// reused rather than duplicated — but rotates when the work is deliberately
+// retried. Multi-operation drives key on the claimed operation's identity and
+// its own attempt, so a sibling operation's retry (which advances the shared
+// parent apply.Attempt but not this operation's) never rotates this operation's
+// key; whole-apply and single-operation drives key on the parent apply.Attempt,
+// which advances only on that apply's own failed_retryable claim. The tuple is
+// hashed so the stored key stays within the column width and is free of
+// delimiter collisions between variable-length identifiers.
+func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) string {
+	parts := []string{
+		"schemabot-remote-apply-v1",
+		apply.ApplyIdentifier,
+	}
+	if scope.usesOperationRemoteResume() {
+		parts = append(parts, "operation", scope.operation.Deployment, scope.operation.OperationKey,
+			strconv.Itoa(scope.operation.Attempt))
+	} else {
+		parts = append(parts, "whole", strconv.Itoa(apply.Attempt))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return "schemabot:v1:" + hex.EncodeToString(sum[:])
+}
+
 // persistRemoteApplyID stores the remote Tern apply id returned by dispatch.
 // Single-operation drives keep it on the parent applies.external_id (mutated in
 // place so the caller's Applies().Update persists it). Multi-operation drives
@@ -1789,16 +1819,17 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	}
 
 	resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
-		PlanId:       plan.PlanIdentifier,
-		Options:      options,
-		Database:     apply.Database,
-		Type:         apply.DatabaseType,
-		DdlChanges:   tasksToProtoTableChanges(tasks),
-		SchemaFiles:  schemaFilesToProto(plan.SchemaFiles),
-		Environment:  apply.Environment,
-		Target:       target,
-		Caller:       apply.Caller,
-		TargetShards: taskTargetShards(tasks),
+		PlanId:         plan.PlanIdentifier,
+		Options:        options,
+		Database:       apply.Database,
+		Type:           apply.DatabaseType,
+		DdlChanges:     tasksToProtoTableChanges(tasks),
+		SchemaFiles:    schemaFilesToProto(plan.SchemaFiles),
+		Environment:    apply.Environment,
+		Target:         target,
+		Caller:         apply.Caller,
+		TargetShards:   taskTargetShards(tasks),
+		IdempotencyKey: remoteApplyIdempotencyKey(apply, scope),
 	})
 	if err != nil {
 		if isAmbiguousRemoteApplyDispatchError(err) {

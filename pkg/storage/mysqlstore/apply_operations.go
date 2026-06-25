@@ -20,7 +20,7 @@ import (
 
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, state, error_message,
-	cutover_policy, on_failure, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
+	cutover_policy, on_failure, attempt, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
 
 // mysqlErrDupEntry is MySQL's error number for a duplicate-key violation.
@@ -952,6 +952,34 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		// the row lock this UPDATE takes serializes them, so the second sees the
 		// already-incremented attempt and does not overshoot maxRecoveryAttempts.
 		if ad.State == state.ApplyOperation.FailedRetryable {
+			// Advance the operation's own attempt only on a genuine deliberate
+			// redispatch — the parent apply is still failed_retryable. A
+			// failed_retryable child is also re-claimed for crash recovery when
+			// the parent apply is already active (running) with a stale heartbeat
+			// (its retry was admitted, then the driver crashed); that re-lease
+			// must leave attempt untouched so the orphaned dispatch's idempotency
+			// key stays stable and is reused, not duplicated. The parent-state
+			// gate mirrors the budget bump below; the join lets one statement both
+			// test the parent state and write the child row. Unlike the budget
+			// bump this is not gated on multi-operation: attempt is
+			// operation-local and a sibling's retry must never rotate it.
+			res, err := tx.ExecContext(ctx, `
+				UPDATE apply_operations o
+				JOIN applies a ON a.id = o.apply_id
+				SET o.attempt = o.attempt + 1
+				WHERE o.id = ? AND a.state = ?
+			`, ad.ID, state.Apply.FailedRetryable)
+			if err != nil {
+				return nil, fmt.Errorf("advance attempt for apply_operation %d redispatch: %w", ad.ID, err)
+			}
+			bumped, err := res.RowsAffected()
+			if err != nil {
+				return nil, fmt.Errorf("read attempt bump rows affected for apply_operation %d: %w", ad.ID, err)
+			}
+			if bumped > 0 {
+				ad.Attempt++
+			}
+
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE applies a
 				SET a.attempt = a.attempt + 1, a.updated_at = NOW()
@@ -1357,7 +1385,7 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &ad.State, &errMsg,
-		&ad.CutoverPolicy, &ad.OnFailure, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
+		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err

@@ -125,7 +125,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		Database:    apply.Database,
 		Keyspace:    keyspace,
 		ApplyID:     apply.ApplyIdentifier,
-		RequestedBy: apply.Caller,
+		RequestedBy: actorFromCaller(apply.Caller),
 		Shards:      shardStatuses(shardOrder, opsByShard, tasksByOp),
 		Cells:       cells,
 	}

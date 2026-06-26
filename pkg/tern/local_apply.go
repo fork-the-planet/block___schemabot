@@ -78,10 +78,12 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		Database:    database,
 		Credentials: c.credentials(),
 	})
-	c.logger.Debug("conflict check: engine progress", "task_id", t.TaskIdentifier, "engine_state", result.State, "message", result.Message, "err", err)
 	if err != nil {
+		// result may be nil when err is non-nil, so it must not be dereferenced here.
+		c.logger.Warn("conflict check: engine progress failed", "task_id", t.TaskIdentifier, "err", err)
 		return false
 	}
+	c.logger.Debug("conflict check: engine progress", "task_id", t.TaskIdentifier, "engine_state", result.State, "message", result.Message)
 
 	// Engine says terminal — update storage and unblock.
 	// IMPORTANT: Only trust terminal states, NOT "No active schema change".

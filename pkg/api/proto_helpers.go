@@ -207,6 +207,35 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 		})
 	}
 
+	// Carry per-shard changes so the plan comment can show what applies to which
+	// shard. The namespace-level Changes above collapse a divergent keyspace to a
+	// single entry; the per-shard detail is preserved only here.
+	for _, sp := range resp.Shards {
+		if sp == nil {
+			continue
+		}
+		apiSP := &apitypes.ShardPlanResponse{Namespace: sp.Namespace, Shard: sp.Shard}
+		for _, t := range sp.Changes {
+			if t == nil {
+				continue
+			}
+			apiSP.Changes = append(apiSP.Changes, &apitypes.TableChangeResponse{
+				TableName:    t.TableName,
+				Namespace:    t.Namespace,
+				DDL:          t.Ddl,
+				ChangeType:   protoChangeTypeToOperation(t.ChangeType),
+				IsUnsafe:     t.IsUnsafe,
+				UnsafeReason: t.UnsafeReason,
+			})
+		}
+		// A shard is changing iff it carries changes (the proto contract); drop an
+		// empty shard plan so it never renders a blank shard section downstream.
+		if len(apiSP.Changes) == 0 {
+			continue
+		}
+		httpResp.Shards = append(httpResp.Shards, apiSP)
+	}
+
 	return httpResp
 }
 

@@ -23,6 +23,10 @@ type LintViolationData struct {
 type UnsafeChangeData struct {
 	Table  string
 	Reason string
+	// Shards names the shards this unsafe change applies to, for a sharded plan
+	// where only some shards carry it. Empty for a non-sharded change (applies to
+	// the whole table).
+	Shards []string
 }
 
 // PlanCommentData contains all data needed to render a plan comment.
@@ -69,6 +73,18 @@ type KeyspaceChangeData struct {
 	Statements     []string
 	VSchemaChanged bool
 	VSchemaDiff    string
+
+	// Shards carries this keyspace's per-shard changes for a sharded plan. When
+	// set, the DDL is rendered per shard-group ("what applies where") instead of
+	// the single Statements block — so a keyspace whose shards diverge is shown
+	// faithfully. Empty for a non-sharded keyspace.
+	Shards []KeyspaceShardChange
+}
+
+// KeyspaceShardChange is one shard's planned statements within a keyspace.
+type KeyspaceShardChange struct {
+	Shard      string
+	Statements []string
 }
 
 // RenderPlanComment renders the plan comment markdown.
@@ -237,14 +253,30 @@ func writeOptions(sb *strings.Builder, data PlanCommentData) {
 
 func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspacesWithVSchema int) {
 	for _, ks := range changes {
-		if len(ks.Statements) > 0 {
-			totalStatements += len(ks.Statements)
-		}
+		totalStatements += keyspaceStatementCount(ks)
 		if ks.VSchemaChanged {
 			keyspacesWithVSchema++
 		}
 	}
 	return
+}
+
+// keyspaceStatementCount counts a keyspace's DDL statements for the summary and
+// the no-changes short-circuit. It prefers the collapsed namespace-level
+// Statements; when those are absent but the keyspace carries per-shard changes,
+// it counts the distinct statements across shards, so a sharded plan whose only
+// DDL is per-shard is never miscounted as "no changes".
+func keyspaceStatementCount(ks KeyspaceChangeData) int {
+	if len(ks.Statements) > 0 {
+		return len(ks.Statements)
+	}
+	seen := make(map[string]struct{})
+	for _, sh := range ks.Shards {
+		for _, stmt := range sh.Statements {
+			seen[stmt] = struct{}{}
+		}
+	}
+	return len(seen)
 }
 
 func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements, keyspacesWithVSchema int) {
@@ -315,7 +347,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 
 	for _, ks := range data.Changes {
 		hasVSchemaChanges := ks.VSchemaChanged && !data.IsMySQL
-		hasDDLChanges := len(ks.Statements) > 0
+		hasDDLChanges := len(ks.Statements) > 0 || len(ks.Shards) > 0
 		if !hasDDLChanges && !hasVSchemaChanges {
 			continue
 		}
@@ -340,18 +372,85 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 		}
 
 		if hasDDLChanges {
-			sb.WriteString("```sql\n")
-			for i, stmt := range ks.Statements {
-				sb.WriteString(ddl.FormatDDL(stmt))
-				if i < len(ks.Statements)-1 {
-					sb.WriteString("\n\n")
-				} else {
-					sb.WriteString("\n")
-				}
+			if len(ks.Shards) > 0 {
+				writeShardedPlanDDL(sb, ks.Shards)
+			} else {
+				writePlanDDLBlock(sb, ks.Statements)
 			}
-			sb.WriteString("```\n\n")
 		}
 	}
+}
+
+// writePlanDDLBlock writes a single fenced SQL block of statements.
+func writePlanDDLBlock(sb *strings.Builder, statements []string) {
+	sb.WriteString("```sql\n")
+	for i, stmt := range statements {
+		sb.WriteString(ddl.FormatDDL(stmt))
+		if i < len(statements)-1 {
+			sb.WriteString("\n\n")
+		} else {
+			sb.WriteString("\n")
+		}
+	}
+	sb.WriteString("```\n\n")
+}
+
+// writeShardedPlanDDL renders a sharded keyspace's DDL grouped by change: shards
+// that need the same statements share one block, so a uniform keyspace shows the
+// DDL once and a divergent one shows "what applies where" — each distinct change
+// set with the shards it applies to.
+func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
+	groups := groupKeyspaceShardsByStatements(shards)
+	if len(groups) <= 1 {
+		if len(groups) == 1 {
+			writePlanDDLBlock(sb, groups[0].Statements)
+		}
+		return
+	}
+	sb.WriteString("Shards diverge — what applies where:\n\n")
+	for _, g := range groups {
+		fmt.Fprintf(sb, "**%s**\n\n", planShardList(g.Shards))
+		writePlanDDLBlock(sb, g.Statements)
+	}
+}
+
+type keyspaceShardGroup struct {
+	Shards     []string
+	Statements []string
+}
+
+// groupKeyspaceShardsByStatements buckets shards whose statement set is
+// identical, preserving resolved order, so a uniform keyspace yields one group.
+func groupKeyspaceShardsByStatements(shards []KeyspaceShardChange) []keyspaceShardGroup {
+	var order []string
+	bySig := make(map[string]*keyspaceShardGroup)
+	for _, s := range shards {
+		sig := strings.Join(s.Statements, "\x01")
+		g := bySig[sig]
+		if g == nil {
+			g = &keyspaceShardGroup{Statements: s.Statements}
+			bySig[sig] = g
+			order = append(order, sig)
+		}
+		g.Shards = append(g.Shards, s.Shard)
+	}
+	groups := make([]keyspaceShardGroup, 0, len(order))
+	for _, sig := range order {
+		groups = append(groups, *bySig[sig])
+	}
+	return groups
+}
+
+// planShardList renders a group's shards as "shard `x`" or "shards `x`, `y`".
+func planShardList(shards []string) string {
+	quoted := make([]string, len(shards))
+	for i, s := range shards {
+		quoted[i] = fmt.Sprintf("`%s`", s)
+	}
+	if len(quoted) == 1 {
+		return "shard " + quoted[0]
+	}
+	return "shards " + strings.Join(quoted, ", ")
 }
 
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUnsafe bool, isMySQL bool) {
@@ -361,11 +460,15 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUn
 		sb.WriteString("**⛔ Unsafe Changes Detected:**\n")
 	}
 	for _, c := range changes {
+		table := "`" + c.Table + "`"
+		if len(c.Shards) > 0 {
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+		}
 		reason := ui.CleanLintReason(c.Reason)
 		if reason != "" {
-			fmt.Fprintf(sb, "- `%s`: %s\n", c.Table, reason)
+			fmt.Fprintf(sb, "- %s: %s\n", table, reason)
 		} else {
-			fmt.Fprintf(sb, "- `%s`\n", c.Table)
+			fmt.Fprintf(sb, "- %s\n", table)
 		}
 	}
 	sb.WriteString("\n")

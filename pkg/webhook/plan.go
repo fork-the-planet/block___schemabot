@@ -449,13 +449,14 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 			continue
 		}
 		for _, t := range sp.Changes {
-			if t == nil || !t.IsUnsafe {
+			unsafeChange, ok := t.UnsafeChange()
+			if !ok {
 				continue
 			}
-			k := key{table: t.TableName, reason: t.UnsafeReason}
+			k := key{table: unsafeChange.Table, reason: unsafeChange.Reason}
 			uc := byKey[k]
 			if uc == nil {
-				uc = &templates.UnsafeChangeData{Table: t.TableName, Reason: t.UnsafeReason}
+				uc = &templates.UnsafeChangeData{Table: unsafeChange.Table, Reason: unsafeChange.Reason}
 				byKey[k] = uc
 				order = append(order, k)
 			}

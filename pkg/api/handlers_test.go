@@ -1032,8 +1032,8 @@ func TestExecutePlanPersistsShardPlans(t *testing.T) {
 				}},
 			}},
 			Shards: []*ternv1.ShardPlan{
-				{Namespace: "commerce", Shard: "-80", NeedsChange: true},
-				{Namespace: "commerce", Shard: "80-", NeedsChange: false},
+				{Namespace: "commerce", Shard: "-80"},
+				{Namespace: "commerce", Shard: "80-"},
 			},
 		},
 	}
@@ -1069,8 +1069,8 @@ func TestExecutePlanPersistsShardPlans(t *testing.T) {
 	require.NotNil(t, resp)
 	require.NotNil(t, plans.created)
 	assert.Equal(t, []storage.ShardPlan{
-		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
-		{Namespace: "commerce", Shard: "80-", NeedsChange: false},
+		{Namespace: "commerce", Shard: "-80"},
+		{Namespace: "commerce", Shard: "80-"},
 	}, plans.created.Shards)
 }
 
@@ -1910,7 +1910,7 @@ func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout", false)
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout")
 
 	require.NoError(t, err)
 	assert.Equal(t, int64(123), storedApplyID)
@@ -1953,10 +1953,11 @@ func TestCreateStoredApplyFansOutShardedPlanOperations(t *testing.T) {
 			},
 		},
 	}
+	usersChange := storage.TableChange{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"}
 	plan.Shards = []storage.ShardPlan{
-		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
-		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
-		{Namespace: "commerce", Shard: "-", NeedsChange: false},
+		{Namespace: "commerce", Shard: "80-", Changes: []storage.TableChange{usersChange}},
+		{Namespace: "commerce", Shard: "-80", Changes: []storage.TableChange{usersChange}},
+		{Namespace: "commerce", Shard: "-"}, // unchanged: no changes, stays out of the apply
 	}
 	cfg := testServerConfig()
 	cfg.Databases = map[string]DatabaseConfig{}
@@ -1975,7 +1976,7 @@ func TestCreateStoredApplyFansOutShardedPlanOperations(t *testing.T) {
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	apply, storedApplyID, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-sharded-fanout", true)
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-sharded-fanout")
 
 	require.NoError(t, err)
 	assert.Equal(t, int64(123), storedApplyID)
@@ -2021,9 +2022,10 @@ func TestCreateStoredApplyFansOutShardedPlanWithFinalizerOperation(t *testing.T)
 			},
 		},
 	}
+	usersChange := storage.TableChange{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"}
 	plan.Shards = []storage.ShardPlan{
-		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
-		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+		{Namespace: "commerce", Shard: "80-", Changes: []storage.TableChange{usersChange}},
+		{Namespace: "commerce", Shard: "-80", Changes: []storage.TableChange{usersChange}},
 	}
 	cfg := testServerConfig()
 	cfg.Databases = map[string]DatabaseConfig{}
@@ -2042,7 +2044,7 @@ func TestCreateStoredApplyFansOutShardedPlanWithFinalizerOperation(t *testing.T)
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-sharded-finalizer", true)
+	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-sharded-finalizer")
 
 	require.NoError(t, err)
 	require.Len(t, applies.operations, 3)
@@ -2081,7 +2083,7 @@ func TestCreateStoredApplyDoesNotDropFinalizerOnlyNamespace(t *testing.T) {
 			Artifacts: map[string]string{vSchemaArtifactName: "{\"routing\":true}"},
 		},
 	}
-	plan.Shards = []storage.ShardPlan{{Namespace: "commerce", Shard: "-", NeedsChange: true}}
+	plan.Shards = []storage.ShardPlan{{Namespace: "commerce", Shard: "-", Changes: []storage.TableChange{{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"}}}}
 	cfg := testServerConfig()
 	cfg.Databases = map[string]DatabaseConfig{}
 	cfg.Databases["testdb"] = DatabaseConfig{
@@ -2099,7 +2101,7 @@ func TestCreateStoredApplyDoesNotDropFinalizerOnlyNamespace(t *testing.T) {
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-finalizer-only-namespace", true)
+	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-finalizer-only-namespace")
 
 	require.NoError(t, err)
 	require.Len(t, applies.operations, 2)
@@ -2111,41 +2113,6 @@ func TestCreateStoredApplyDoesNotDropFinalizerOnlyNamespace(t *testing.T) {
 	// commerce shard work produces a task.
 	require.Len(t, tasks.tasks, 1)
 	assert.Equal(t, "users", tasks.tasks[0].TableName)
-}
-
-func TestCreateStoredApplyDoesNotShardWithoutClientOptIn(t *testing.T) {
-	applies := &capturingApplyStore{}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	tasks := &capturingTaskStore{}
-	applies.taskStore = tasks
-	plan := executeApplyTestPlan()
-	plan.Namespaces = map[string]*storage.NamespacePlanData{
-		"commerce": {
-			Tables: []storage.TableChange{
-				{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
-			},
-		},
-	}
-	plan.Shards = []storage.ShardPlan{
-		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
-		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
-	}
-	svc := New(&mockStorageWithApplyStores{
-		plans:     &staticPlanStore{plan: plan},
-		applies:   applies,
-		tasks:     tasks,
-		locks:     &emptyLockStore{},
-		applyLogs: &noopApplyLogStore{},
-		controls:  &memoryControlRequestStore{},
-	}, testServerConfig(), map[string]tern.Client{}, logger)
-
-	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-no-sharded-fanout", false)
-
-	require.NoError(t, err)
-	require.Len(t, applies.operations, 1)
-	assert.Empty(t, applies.operations[0].OperationKey)
-	require.Len(t, tasks.tasks, 1)
-	assert.Empty(t, tasks.tasks[0].Shard)
 }
 
 func TestValidateShardOperationKeyPartsRejectsDelimiter(t *testing.T) {

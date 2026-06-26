@@ -26,7 +26,6 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/schemabot/pkg/tern"
 )
 
 const applyOperationKeyMaxLen = 255
@@ -859,7 +858,7 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		client.SetObserver(storedApplyID, observer)
 	}
 
-	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, clientSupportsShardedApplyFanout(client), attachObserver)
+	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)
 	if err != nil {
 		recordApplyError("enqueue apply", err)
 		return nil, 0, err
@@ -886,11 +885,10 @@ func (s *Service) enqueueApply(
 	plan *storage.Plan,
 	req ApplyRequest,
 	options map[string]string,
-	shardedFanoutSupported bool,
 	onApplyCreated func(int64),
 ) (string, int64, error) {
 	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, options, applyIdentifier, shardedFanoutSupported)
+	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, options, applyIdentifier)
 	if err != nil {
 		return "", 0, err
 	}
@@ -906,7 +904,6 @@ func (s *Service) createStoredApply(
 	req ApplyRequest,
 	options map[string]string,
 	applyIdentifier string,
-	shardedFanoutSupported bool,
 ) (*storage.Apply, int64, error) {
 	now := time.Now()
 	applyOpts := storage.ApplyOptionsFromMap(options)
@@ -961,7 +958,7 @@ func (s *Service) createStoredApply(
 	taskChanges := applyTaskChanges(plan)
 	cutoverPolicy := s.config.CutoverPolicyFor(plan.Database, req.Environment)
 	onFailure := s.config.OnFailure(plan.Database, req.Environment)
-	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, targets, req.Environment, applyOpts, cutoverPolicy, onFailure, now, shardedFanoutSupported)
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, targets, req.Environment, applyOpts, cutoverPolicy, onFailure, now)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -998,11 +995,6 @@ func (s *Service) createStoredApply(
 	return apply, storedApplyID, nil
 }
 
-func clientSupportsShardedApplyFanout(client tern.Client) bool {
-	capability, ok := client.(tern.ShardedApplyFanoutSupport)
-	return ok && capability.SupportsShardedApplyFanout()
-}
-
 // applyTaskChanges returns the per-table DDL changes that become apply tasks.
 // VSchema application is no longer modeled as a synthetic task: PlanetScale
 // surfaces its VSchema status/diff from engine resume metadata, and a sharded
@@ -1020,10 +1012,13 @@ func buildApplyOperationGroups(
 	cutoverPolicy string,
 	onFailure string,
 	now time.Time,
-	shardedFanoutSupported bool,
 ) ([]*storage.ApplyOperationWithTasks, bool, error) {
-	if shardedFanoutSupported && canBuildShardedOperationGroups(plan, taskChanges) {
-		groups, err := buildShardedApplyOperationGroups(plan, taskChanges, targets, environment, applyOpts, cutoverPolicy, onFailure, now)
+	// Fan a plan out per shard whenever it carries per-shard changes. Only an
+	// instance-local sharded engine (Strata) produces those, so an
+	// externally-authoritative engine (e.g. PlanetScale) — whose plans never
+	// carry per-shard changes — is never fanned out, regardless of transport.
+	if canBuildShardedOperationGroups(plan, taskChanges) {
+		groups, err := buildShardedApplyOperationGroups(plan, targets, environment, applyOpts, cutoverPolicy, onFailure, now)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1066,7 +1061,6 @@ func canBuildShardedOperationGroups(plan *storage.Plan, taskChanges []storage.Ta
 
 func buildShardedApplyOperationGroups(
 	plan *storage.Plan,
-	taskChanges []storage.TableChange,
 	targets []routing.ExecutionTarget,
 	environment string,
 	applyOpts storage.ApplyOptions,
@@ -1075,28 +1069,46 @@ func buildShardedApplyOperationGroups(
 	now time.Time,
 ) ([]*storage.ApplyOperationWithTasks, error) {
 	shardsByNamespace := changingShardsByNamespace(plan.Shards)
-	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets)*(len(taskChanges)+1))
+	namespaces := make([]string, 0, len(shardsByNamespace))
+	for namespace := range shardsByNamespace {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets)*(len(plan.Shards)+1))
 	groupsByTargetAndKey := make(map[string]*storage.ApplyOperationWithTasks)
 	for _, target := range targets {
-		for _, ddlChange := range taskChanges {
-			for _, shard := range shardsByNamespace[ddlChange.Namespace] {
-				if err := validateShardOperationKeyParts(ddlChange.Namespace, shard.Shard, ddlChange.Table); err != nil {
-					return nil, err
-				}
-				operationKey := shardOperationKey(ddlChange.Namespace, shard.Shard, ddlChange.Table)
-				if len(operationKey) > applyOperationKeyMaxLen {
-					return nil, fmt.Errorf("operation key for namespace %q shard %q table %q exceeds %d characters", ddlChange.Namespace, shard.Shard, ddlChange.Table, applyOperationKeyMaxLen)
-				}
-				groupKey := target.Deployment + "\x00" + operationKey
-				group := groupsByTargetAndKey[groupKey]
-				if group == nil {
-					group = &storage.ApplyOperationWithTasks{
-						Operation: newPendingApplyOperation(target, operationKey, cutoverPolicy, onFailure, now),
+		for _, namespace := range namespaces {
+			for _, shard := range shardsByNamespace[namespace] {
+				// Each shard is driven from its own changes; it is in
+				// shardsByNamespace only because those changes are non-empty.
+				for _, ddlChange := range shard.Changes {
+					// Fail closed on a malformed per-shard change rather than building
+					// an operation key or engine request from empty/mismatched fields.
+					if strings.TrimSpace(ddlChange.Table) == "" || strings.TrimSpace(ddlChange.DDL) == "" || strings.TrimSpace(ddlChange.Operation) == "" {
+						return nil, fmt.Errorf("namespace %q shard %q has a change with an empty table, DDL, or operation", namespace, shard.Shard)
 					}
-					groupsByTargetAndKey[groupKey] = group
-					groups = append(groups, group)
+					if ddlChange.Namespace != "" && ddlChange.Namespace != namespace {
+						return nil, fmt.Errorf("namespace %q shard %q change for table %q has mismatched namespace %q", namespace, shard.Shard, ddlChange.Table, ddlChange.Namespace)
+					}
+					if err := validateShardOperationKeyParts(namespace, shard.Shard, ddlChange.Table); err != nil {
+						return nil, err
+					}
+					operationKey := shardOperationKey(namespace, shard.Shard, ddlChange.Table)
+					if len(operationKey) > applyOperationKeyMaxLen {
+						return nil, fmt.Errorf("operation key for namespace %q shard %q table %q exceeds %d characters", namespace, shard.Shard, ddlChange.Table, applyOperationKeyMaxLen)
+					}
+					groupKey := target.Deployment + "\x00" + operationKey
+					group := groupsByTargetAndKey[groupKey]
+					if group == nil {
+						group = &storage.ApplyOperationWithTasks{
+							Operation: newPendingApplyOperation(target, operationKey, cutoverPolicy, onFailure, now),
+						}
+						groupsByTargetAndKey[groupKey] = group
+						groups = append(groups, group)
+					}
+					group.Tasks = append(group.Tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard.Shard, now))
 				}
-				group.Tasks = append(group.Tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard.Shard, now))
 			}
 		}
 		// Every namespace that changes its VSchema gets a task-less
@@ -1163,7 +1175,8 @@ func validateOperationKeyPart(label, value string) error {
 func changingShardsByNamespace(shards []storage.ShardPlan) map[string][]storage.ShardPlan {
 	shardsByNamespace := make(map[string][]storage.ShardPlan)
 	for _, shard := range shards {
-		if !shard.NeedsChange {
+		// A shard is changing iff it carries its own changes.
+		if len(shard.Changes) == 0 {
 			continue
 		}
 		shardsByNamespace[shard.Namespace] = append(shardsByNamespace[shard.Namespace], shard)

@@ -1008,6 +1008,18 @@ func (s applyTaskScope) suppressesDirectParentApplyWrites() bool {
 	return s.usesOperationRemoteResume()
 }
 
+// finalizerOperationScope reports whether this drive owns a task-less
+// group_finalizer operation. Such an operation has no task rows, so the
+// operator's task-derived operation→parent projection can never move its
+// operation row off pending: the terminal remote state (completion or failure)
+// would be lost. A finalizer drive must therefore persist its own operation
+// row's terminal state, mirroring LocalClient.driveGroupFinalizer.
+func (s applyTaskScope) finalizerOperationScope() bool {
+	return s.usesOperationRemoteResume() &&
+		s.operation != nil &&
+		s.operation.OperationKind == storage.ApplyOperationKindGroupFinalizer
+}
+
 // remoteApplyID resolves the remote Tern apply id sent on this drive's
 // Progress/Stop/Start/Cutover calls. Multi-operation drives read the claimed
 // operation's engine_resume_context (which may be empty before dispatch);
@@ -1189,7 +1201,14 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 	if err != nil {
 		return err
 	}
-	// Fail closed before any dispatch or state mutation: an operation that
+	// A group_finalizer is task-less by design: it applies the namespace VSchema
+	// once its sibling shard work completes. Drive it over gRPC as a VSchema-only
+	// apply rather than failing closed on the empty task set, mirroring
+	// LocalClient.ResumeApplyOperation's finalizer branch.
+	if scope.operation != nil && scope.operation.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		return c.dispatchRemoteGroupFinalizer(ctx, apply, scope)
+	}
+	// Fail closed before any dispatch or state mutation: a work operation that
 	// resolves to no tasks is an invalid or stale claim. The shared resume path
 	// would otherwise mark the whole parent apply failed (dispatchPendingApply
 	// and the remote-failure sites set applies.state regardless of scope), which
@@ -1203,6 +1222,86 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
 	}
 	return c.resumeApply(ctx, apply, scope)
+}
+
+// dispatchRemoteGroupFinalizer drives a task-less group_finalizer apply_operation
+// over gRPC. It is the remote counterpart to LocalClient.driveGroupFinalizer:
+// the control plane cannot run the engine, so it dispatches the namespace's
+// VSchema as a VSchema-only apply (no DDL, no target shards) to the data plane,
+// which applies it via its task-less VSchema-only path
+// (isTasklessVSchemaOnlyPlan); records the remote apply id on the operation; and
+// polls to completion. Carrying both a VSchema change and the plan's schema
+// files lets the remote drive it whether it has the plan locally or materializes
+// it from the dispatch.
+func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
+	op := scope.operation
+	namespace := namespaceFromFinalizerKey(op.OperationKey)
+	if namespace == "" {
+		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		return fmt.Errorf("load plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, err)
+	}
+	if plan == nil {
+		return fmt.Errorf("plan %d not found for group_finalizer apply_operation %d (apply %s)", apply.PlanID, op.ID, apply.ApplyIdentifier)
+	}
+	// Fail closed if the namespace carries no VSchema artifact, mirroring the
+	// local finalizer drive.
+	if _, err := finalizerVSchemaChanges(plan, namespace); err != nil {
+		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+
+	// Dispatch only if this operation has not already been dispatched. On resume
+	// the recorded remote apply id lets us poll the existing remote apply instead
+	// of starting a duplicate.
+	if scope.remoteApplyID(apply) == "" {
+		options := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation).Map()
+		target := options["target"]
+		if target == "" {
+			target = apply.Database
+		}
+		if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+			return err
+		}
+		resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
+			PlanId:      plan.PlanIdentifier,
+			Options:     options,
+			Database:    apply.Database,
+			Type:        apply.DatabaseType,
+			DdlChanges:  []*ternv1.TableChange{{Namespace: namespace, TableName: "VSchema: " + namespace, ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA}},
+			SchemaFiles: schemaFilesToProto(plan.SchemaFiles),
+			Environment: apply.Environment,
+			Target:      target,
+			Caller:      apply.Caller,
+			// No TargetShards: the VSchema is namespace-level, not per shard.
+			IdempotencyKey: remoteApplyIdempotencyKey(apply, scope),
+		})
+		if err != nil {
+			if isAmbiguousRemoteApplyDispatchError(err) {
+				return fmt.Errorf("group_finalizer apply_operation %d (apply %s) has ambiguous remote dispatch outcome: %w", op.ID, apply.ApplyIdentifier, err)
+			}
+			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
+				return fmt.Errorf("mark group_finalizer apply_operation %d failed after remote apply error: %w", op.ID, markErr)
+			}
+			return fmt.Errorf("dispatch group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+		}
+		if resp == nil || !resp.Accepted || resp.ApplyId == "" {
+			errMsg := "remote group_finalizer apply was not accepted"
+			if resp != nil && resp.ErrorMessage != "" {
+				errMsg = resp.ErrorMessage
+			}
+			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
+				return fmt.Errorf("mark group_finalizer apply_operation %d failed: %w", op.ID, markErr)
+			}
+			return fmt.Errorf("dispatch group_finalizer apply_operation %d (apply %s): %s", op.ID, apply.ApplyIdentifier, errMsg)
+		}
+		if err := c.persistRemoteApplyID(ctx, apply, scope, resp.ApplyId); err != nil {
+			return fmt.Errorf("store remote apply id for group_finalizer apply_operation %d: %w", op.ID, err)
+		}
+	}
+
+	return c.pollForCompletion(ctx, apply, false, scope, false)
 }
 
 // ResumeApplyOperationCutover drives a single barrier-parked apply_operation
@@ -2208,6 +2307,16 @@ func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remot
 	// the parent applies.state via the projection CAS; the driver must not write
 	// the parent failure or run its parent-level side effects.
 	if scope.suppressesDirectParentApplyWrites() {
+		// A task-less group_finalizer has no task rows to carry the failure, so the
+		// operator could never derive its failed operation row. Mark it failed
+		// directly on a non-retryable failure; a retryable failure is left
+		// non-terminal so the operator re-drives the operation (and re-polls the
+		// existing remote apply).
+		if scope.finalizerOperationScope() && !retryable {
+			if err := c.storage.ApplyOperations().MarkFailed(ctx, scope.applyOperationID, message); err != nil {
+				return fmt.Errorf("mark group_finalizer apply_operation %d failed after remote apply failure: %w", scope.applyOperationID, err)
+			}
+		}
 		slog.Debug("recorded operation task failures during multi-operation drive; parent failure is owned by the rollout projection",
 			"apply_id", storedApply.ApplyIdentifier,
 			"apply_db_id", storedApply.ID,
@@ -2323,6 +2432,13 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	// projection CAS and completes any parent control requests. The driver must
 	// not write the parent row or run its parent-level side effects here.
 	if scope.suppressesDirectParentApplyWrites() {
+		// A task-less group_finalizer has no task rows for the operator to derive
+		// the operation row from, so persist its terminal state directly here.
+		if scope.finalizerOperationScope() {
+			if err := c.persistFinalizerOperationTerminalState(ctx, scope.applyOperationID, remoteApply.State, remoteApply.ErrorMessage); err != nil {
+				return err
+			}
+		}
 		slog.Debug("skipping parent terminal write during multi-operation drive; operation tasks are resolved and parent state is owned by the rollout projection",
 			"apply_id", storedApply.ApplyIdentifier,
 			"apply_db_id", storedApply.ID,
@@ -2356,6 +2472,27 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	c.logApplyStateTransition(ctx, storedApply, remoteTerminalApplyLogLevel(storedApply), remoteTerminalApplyLogMessage(storedApply), oldState)
 	*remoteApply = *storedApply
 	metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Deployment, storedApply.Environment)
+	return nil
+}
+
+// persistFinalizerOperationTerminalState reflects a remote terminal state onto a
+// task-less group_finalizer operation row. Because such an operation carries no
+// task rows, the operator's task-derived projection can never move it: the drive
+// owns its terminal transition, mirroring LocalClient.driveGroupFinalizer
+// (MarkCompleted on success, MarkFailed on failure). Non-completed/non-failed
+// terminal states (stopped/cancelled) stay owned by the operator's stop/cancel
+// handling, so the drive leaves the operation row untouched for those.
+func (c *GRPCClient) persistFinalizerOperationTerminalState(ctx context.Context, applyOperationID int64, terminalState, errMsg string) error {
+	switch {
+	case state.IsState(terminalState, state.Apply.Completed):
+		if err := c.storage.ApplyOperations().MarkCompleted(ctx, applyOperationID); err != nil {
+			return fmt.Errorf("mark group_finalizer apply_operation %d completed from remote terminal state: %w", applyOperationID, err)
+		}
+	case state.IsState(terminalState, state.Apply.Failed):
+		if err := c.storage.ApplyOperations().MarkFailed(ctx, applyOperationID, errMsg); err != nil {
+			return fmt.Errorf("mark group_finalizer apply_operation %d failed from remote terminal state: %w", applyOperationID, err)
+		}
+	}
 	return nil
 }
 

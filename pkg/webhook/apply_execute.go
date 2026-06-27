@@ -60,6 +60,16 @@ func (h *Handler) executeApply(
 			h.logger.Error("failed to release lock after no-changes confirm",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
 		}
+		// The target already matches the PR schema — apply found nothing to do.
+		// Record the passing (no-change) check result and refresh the aggregate so
+		// the schema check reflects that the target is up to date, the same as the
+		// no-change plan path.
+		if headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment); checkErr != nil {
+			h.logger.Error("failed to record no-changes check after apply",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", checkErr)
+		} else if headSHA != "" {
+			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		}
 		h.postComment(repo, pr, installationID, templates.RenderApplyConfirmNoChanges(database, environment))
 		return
 	}

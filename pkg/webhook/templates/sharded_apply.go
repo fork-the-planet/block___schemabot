@@ -10,13 +10,13 @@ import (
 
 // ShardedApplyData is the input to the sharded-apply comment: an apply that fans
 // out across the shards of a single keyspace within one deployment. Its unit of
-// work is one operation per (shard, table). Shards are grouped by their change
-// signature: an apply whose shards all need the same change renders one status
-// table with the DDL once, and an apply whose shards diverge — different tables,
-// or the same table computing to different DDL because shards drifted — renders
-// one group per distinct change set, each tying its shards' statuses to the DDL
-// it runs. This is distinct from the multi-deployment comment, whose unit is the
-// deployment.
+// work is one operation per (shard, table). The applied comment shows shard
+// status only — the DDL is already shown in the plan and apply-gate comments, so
+// it is not repeated here. Shards are still grouped by their change signature so
+// a divergent apply (shards that drifted to different changes) shows which shards
+// moved together: a uniform apply renders one status table, a divergent one
+// renders a labelled status group per distinct change set. This is distinct from
+// the multi-deployment comment, whose unit is the deployment.
 type ShardedApplyData struct {
 	// State is the aggregate apply state (state.Apply.*), driving the headline.
 	State string
@@ -59,7 +59,9 @@ type ShardCell struct {
 	DDL   string
 }
 
-// ShardChange is one table's DDL within a group, shown once for the whole group.
+// ShardChange is one table's DDL within a group. The DDL is not rendered in the
+// applied comment; it defines the group's change signature so shards that apply
+// the same change are grouped together.
 type ShardChange struct {
 	Table string
 	DDL   string
@@ -75,8 +77,9 @@ type shardGroup struct {
 // RenderShardedApplyComment renders the PR comment for a sharded apply: the
 // shared apply header and metadata, a per-shard count histogram, the first
 // failed shard's error lifted to the top, then the shards grouped by change
-// signature — a single group renders one status table with the DDL once; more
-// than one renders a labelled group per distinct change set.
+// signature — a single group renders one status table; more than one renders a
+// labelled status group per distinct change set. The comment is status-only; the
+// DDL is shown in the plan and apply-gate comments, not repeated here.
 func RenderShardedApplyComment(data ShardedApplyData) string {
 	var sb strings.Builder
 	renderedAt := currentTimestamp()
@@ -88,18 +91,19 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 	writeShardFirstFailure(&sb, data.Shards)
 
 	fmt.Fprintf(&sb, "\n#### Keyspace `%s`\n", data.Keyspace)
+	// The applied comment shows shard status only. The DDL (what changes) is
+	// already shown in the plan and apply-gate comments, so repeating it here adds
+	// nothing — and rendering "DDL unavailable" when the apply path has no per-shard
+	// DDL is pure noise. Shards are still grouped by change so a divergent apply
+	// shows which shards moved together.
 	groups := groupShardsBySignature(data.Shards, data.Cells)
 	if len(groups) <= 1 {
 		writeShardStatusTable(&sb, data.Shards)
-		if len(groups) == 1 {
-			writeGroupDDL(&sb, groups[0].Changes)
-		}
 	} else {
 		sb.WriteString("\nShards diverge — grouped by change:\n")
 		for _, g := range groups {
 			fmt.Fprintf(&sb, "\n**%s**\n", shardList(g.Shards))
 			writeShardStatusTable(&sb, g.Shards)
-			writeGroupDDL(&sb, g.Changes)
 		}
 	}
 
@@ -243,20 +247,6 @@ func writeShardStatusTable(sb *strings.Builder, shards []ShardStatus) {
 	sb.WriteString("\n| Shard | Status |\n| --- | --- |\n")
 	for _, s := range shards {
 		fmt.Fprintf(sb, "| `%s` | %s |\n", s.Shard, shardStatusCell(s))
-	}
-}
-
-// writeGroupDDL writes a group's table changes, each DDL once.
-func writeGroupDDL(sb *strings.Builder, changes []ShardChange) {
-	for _, c := range changes {
-		// Guard against an empty DDL, which would render a blank ```sql box. The
-		// DDL should always be present; if it is missing the change data is
-		// incomplete, so say so rather than show an empty code block.
-		if strings.TrimSpace(c.DDL) == "" {
-			fmt.Fprintf(sb, "\n`%s` — _DDL unavailable_\n", c.Table)
-			continue
-		}
-		fmt.Fprintf(sb, "\n`%s`\n```sql\n%s\n```\n", c.Table, c.DDL)
 	}
 }
 

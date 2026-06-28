@@ -275,7 +275,6 @@ func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *stora
 		// Serve progress without the enrichment and log the storage uncertainty.
 		s.logger.Warn("progress response will omit per-deployment operations",
 			"apply_id", apply.ApplyIdentifier,
-			"apply_db_id", apply.ID,
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"error", err)
@@ -310,7 +309,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	if shouldServeProgressFromStorage(apply.State) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
-			s.logger.Error("failed to read apply progress from storage", "apply_id", applyID, "state", apply.State, "error", err)
+			s.logger.Error("failed to read apply progress from storage", append(apply.LogAttrs(), "error", err)...)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
 			return
 		}
@@ -369,7 +368,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	if shouldServeRemoteProgressFromStorage(apply, client) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), queuedRemoteProgressApply(apply))
 		if err != nil {
-			s.logger.Error("failed to read queued remote apply progress from storage", "apply_id", applyID, "state", apply.State, "error", err)
+			s.logger.Error("failed to read queued remote apply progress from storage", append(apply.LogAttrs(), "error", err)...)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
 			return
 		}
@@ -382,7 +381,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		Environment: apply.Environment,
 	})
 	if err != nil {
-		s.logger.Error("progress failed", "apply_id", applyID, "database", apply.Database, "error", err)
+		s.logger.Error("progress failed", append(apply.LogAttrs(), "error", err)...)
 		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeEngineUnavailable, "progress failed: "+err.Error())
 		return
 	}
@@ -1068,7 +1067,7 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		task.ChecksumRowsTotal = tp.ChecksumRowsTotal
 		task.UpdatedAt = now
 		if err := s.storage.Tasks().Update(ctx, task); err != nil {
-			s.logger.Error("sync task failed", "task_id", task.TaskIdentifier, "error", err)
+			s.logger.Error("sync task failed", append(task.LogAttrs(), "error", err)...)
 			continue
 		}
 		synced++

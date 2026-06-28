@@ -34,7 +34,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	apply.StartedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
+		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 	}
 
 	var failedTask *storage.Task
@@ -117,11 +117,11 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, task *storage.Task) ta
 	}
 	freshTask, err := c.storage.Tasks().Get(ctx, task.TaskIdentifier)
 	if err != nil {
-		c.logger.Error("failed to fetch task state", "task_id", task.TaskIdentifier, "error", err)
+		c.logger.Error("failed to fetch task state", append(task.LogAttrs(), "error", err)...)
 		return taskSkip
 	}
 	if freshTask == nil {
-		c.logger.Error("task not found", "task_id", task.TaskIdentifier)
+		c.logger.Error("task not found", task.LogAttrs()...)
 		return taskSkip
 	}
 	if freshTask.State == state.Task.Stopped {
@@ -181,7 +181,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 		taskCreds, err = c.credentialsForMySQLNamespace(task.Namespace)
 		if err != nil {
 			c.markTaskFailed(ctx, task, err.Error())
-			c.logger.Error("task failed to resolve namespace credentials", "error", err, "task_id", task.TaskIdentifier, "namespace", task.Namespace, "table", task.TableName)
+			c.logger.Error("task failed to resolve namespace credentials", append(task.LogAttrs(), "namespace", task.Namespace, "error", err)...)
 			return taskFailed
 		}
 	}
@@ -197,12 +197,12 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 		} else {
 			c.markTaskFailed(ctx, task, err.Error())
 		}
-		c.logger.Error("task failed", "error", err, "task_id", task.TaskIdentifier, "table", task.TableName)
+		c.logger.Error("task failed", append(task.LogAttrs(), "error", err)...)
 		return taskFailed
 	}
 	if !result.Accepted {
 		c.markTaskFailed(ctx, task, result.Message)
-		c.logger.Error("task rejected", "message", result.Message, "task_id", task.TaskIdentifier, "table", task.TableName)
+		c.logger.Error("task rejected", append(task.LogAttrs(), "message", result.Message)...)
 		return taskFailed
 	}
 
@@ -277,10 +277,7 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 				if err := c.storage.Applies().Heartbeat(hbCtx, apply.ID); err != nil {
 					if errors.Is(err, storage.ErrApplyLeaseLost) {
 						c.logger.Warn("heartbeat failed because apply lease was lost; local driver will stop executing and writing apply state",
-							"apply_id", apply.ApplyIdentifier,
-							"database", apply.Database,
-							"environment", apply.Environment,
-							"error", err)
+							append(apply.LogAttrs(), "error", err)...)
 						metrics.RecordOperatorResumeFailure(hbCtx, apply.Database, apply.Deployment, apply.Environment, "lease_lost")
 						for _, cancel := range cancelApply {
 							if cancel != nil {
@@ -290,7 +287,7 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 						cancel()
 						return
 					}
-					c.logger.Warn("heartbeat failed", "apply_id", apply.ApplyIdentifier, "error", err)
+					c.logger.Warn("heartbeat failed", append(apply.LogAttrs(), "error", err)...)
 				}
 			}
 		}
@@ -348,7 +345,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				// grouped poll.
 				var permanent *engine.PermanentError
 				if errors.As(err, &permanent) {
-					c.logger.Error("progress check failed with permanent error", "error", err, "task_id", task.TaskIdentifier)
+					c.logger.Error("progress check failed with permanent error", append(task.LogAttrs(), "error", err)...)
 					c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed: %v", err))
 					return taskFailed
 				}
@@ -357,7 +354,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				// database's active-apply slot and blocks every later apply. Fail
 				// after a bounded run of errors, matching the grouped poll.
 				consecutiveErrors++
-				c.logger.Warn("progress check failed", "error", err, "task_id", task.TaskIdentifier, "consecutive_errors", consecutiveErrors)
+				c.logger.Warn("progress check failed", append(task.LogAttrs(), "error", err, "consecutive_errors", consecutiveErrors)...)
 				if consecutiveErrors >= 10 {
 					if c.shouldRetryEngineError(err) {
 						c.markTaskRetryable(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err))
@@ -464,7 +461,7 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) {
 	now := time.Now()
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
-		c.logger.Error("failed to reload apply before sequential finalization", "apply_id", apply.ApplyIdentifier, "error", err)
+		c.logger.Error("failed to reload apply before sequential finalization", append(apply.LogAttrs(), "error", err)...)
 		return
 	} else if freshApply != nil && state.IsTerminalApplyState(freshApply.State) {
 		c.logger.Info("apply already terminal in storage, not overwriting during sequential finalization",
@@ -499,12 +496,12 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+		c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 	}
 	if state.IsTerminalApplyState(apply.State) {
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			c.logger.Warn("failed to complete pending stop request after sequential finalization",
-				"apply_id", apply.ApplyIdentifier, "error", err)
+				append(apply.LogAttrs(), "error", err)...)
 			return
 		}
 	}

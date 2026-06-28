@@ -1171,6 +1171,69 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 	return nil
 }
 
+// mirrorRemoteDisplayMetadata persists the data-plane progress response's display
+// fields (deploy-request URL, VSchema status) onto the control-plane operation's
+// engine_resume_metadata, so the PR comment's stored-state display projection
+// (resolveDisplayByOperation) can render them. For a remote (gRPC) apply the
+// engine runs in the data plane, so the control plane never sees this metadata
+// otherwise. It returns the blob it persisted (or lastBlob unchanged) so the
+// caller skips redundant writes across polls. Best-effort: a failure is logged,
+// not fatal — the next poll re-mirrors it.
+func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *storage.Apply, scope applyTaskScope, md map[string]string, lastBlob string) string {
+	if c.storage == nil || apply == nil || apply.Engine != storage.EnginePlanetScale {
+		return lastBlob
+	}
+	blob, err := PSDisplayMetadataStorageBlob(md)
+	if err != nil {
+		slog.Warn("comment may omit engine display metadata: failed to encode remote display metadata",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+		return lastBlob
+	}
+	if blob == "" || blob == lastBlob {
+		return lastBlob
+	}
+	// Load the operation so the write can preserve its engine_resume_context (the
+	// remote apply id for a multi-operation drive). SaveEngineResumeState writes
+	// both columns, so if we cannot read the current context we must not write:
+	// clobbering the remote apply id to empty would break resuming the remote
+	// apply after a restart. The mirror is best-effort — skip and retry next poll.
+	op, err := c.operationForDisplayMirror(ctx, apply, scope)
+	if err != nil || op == nil {
+		slog.Warn("comment may omit engine display metadata: could not load apply_operation to preserve resume context",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+		return lastBlob
+	}
+	if err := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
+		ApplyOperationID: op.ID,
+		MigrationContext: op.EngineResumeContext,
+		Metadata:         blob,
+	}); err != nil {
+		slog.Warn("comment may omit engine display metadata: failed to persist to control-plane operation",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
+		return lastBlob
+	}
+	return blob
+}
+
+// operationForDisplayMirror loads the apply_operation whose
+// engine_resume_metadata should carry the display projection. An
+// operation-scoped drive already knows its operation id; a whole-apply
+// (single-operation) drive resolves the apply's sole operation. The loaded row
+// carries the current engine_resume_context the mirror must preserve.
+func (c *GRPCClient) operationForDisplayMirror(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (*storage.ApplyOperation, error) {
+	if scope.applyOperationID > 0 {
+		return c.storage.ApplyOperations().Get(ctx, scope.applyOperationID)
+	}
+	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list apply operations for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if len(ops) != 1 {
+		return nil, fmt.Errorf("apply %s has %d operations; need an operation scope to mirror display metadata", apply.ApplyIdentifier, len(ops))
+	}
+	return ops[0], nil
+}
+
 // loadApplyTasks loads the task rows the remote drive operates on, scoped either
 // to the whole apply or to a single apply_operation. It never widens an
 // operation-scoped query back to the whole apply.
@@ -2800,6 +2863,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 	consecutiveProgressErrors := 0
 	loggedStoppedAfterStart := false
 	var stoppedAfterStartDeadline time.Time
+	var lastDisplayBlob string
 	for {
 		select {
 		case <-ctx.Done():
@@ -2875,6 +2939,13 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id", apply.ExternalID)
 				return c.failMissingRemoteApply(ctx, apply, message, nil, scope)
 			}
+
+			// Mirror the data-plane display metadata (deploy-request URL, VSchema
+			// status) onto the control-plane operation so the PR comment's
+			// stored-state projection can render it. The engine that produces this
+			// metadata runs in the data plane, so the control plane never sees it
+			// otherwise.
+			lastDisplayBlob = c.mirrorRemoteDisplayMetadata(ctx, apply, scope, resp.Metadata, lastDisplayBlob)
 
 			// Update apply state from the remote response. An exact apply-id poll
 			// must return a concrete state; unknown states are unsafe to reconcile.

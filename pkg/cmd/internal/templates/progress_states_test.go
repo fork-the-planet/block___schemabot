@@ -57,6 +57,8 @@ func TestWriteStatusListHasMoreFooter(t *testing.T) {
 
 	assert.Contains(t, output, "Recent schema changes")
 	assert.Contains(t, output, "apply-example")
+	assert.Contains(t, output, "STARTED")
+	assert.NotContains(t, output, "DURATION")
 	assert.Contains(t, output, "Showing the 20 most recent schema changes. Use --limit N to show more.")
 	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details")
 }
@@ -112,6 +114,37 @@ func TestWriteStatusListExternalID(t *testing.T) {
 	assert.Contains(t, output, "EXTERNAL ID")
 	assert.Contains(t, output, "external-123")
 	assert.Contains(t, output, "apply-complete")
+}
+
+func TestWriteStatusListDeploymentExternalOperationID(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount:    1,
+			Limit:          20,
+			MaxLimit:       1000,
+			ShowExternalID: true,
+			Deployment:     "deploy-a",
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:             "apply-running",
+					ExternalID:          "parent-external",
+					ExternalOperationID: "remote-operation-a",
+					Database:            "orders",
+					Environment:         "staging",
+					Deployment:          "deploy-a",
+					State:               state.Apply.Running,
+					StartedAt:           "2026-05-28T12:00:00Z",
+					Caller:              "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "EXTERNAL OP ID")
+	assert.Contains(t, output, "DEPLOYMENT")
+	assert.Contains(t, output, "remote-operation-a")
+	assert.NotContains(t, output, "parent-external")
+	assert.Contains(t, output, "deploy-a")
 }
 
 func TestWriteStatusListFailedOnly(t *testing.T) {

@@ -4635,16 +4635,40 @@ Volume: ██░░░░░░░░░ 2/11
 
 3 active schema changes
 
-  APPLY ID      DATABASE   ENV         STATE                STARTED         DURATION  CALLER
-  apply_abc123  orders-db  staging     Running              15 minutes ago  15m       
-  apply_def456  users-db   production  Waiting for cutover  45 minutes ago  45m       
-  apply_ghi789  analytics  staging     Stopped              2 hours ago     2h        
+  APPLY ID      DATABASE   ENV         STATE                STARTED         CALLER
+  apply_abc123  orders-db  staging     Running              15 minutes ago  
+  apply_def456  users-db   production  Waiting for cutover  45 minutes ago  
+  apply_ghi789  analytics  staging     Stopped              2 hours ago     
 
 Use 'schemabot status <apply_id>' to view details
 
 No active applies:
 
 No recent schema changes
+
+```
+</details>
+
+<details>
+<summary><a name="status-for-deployment"></a><strong>Status For Deployment</strong></summary>
+
+```
+
+1 active schema change
+
+  APPLY ID              EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        CALLER
+  apply-multi-a1b2c3d4  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  octocat
+
+Use 'schemabot status <apply_id>' to view details
+
+Multiple matching operations:
+
+1 active schema change
+
+  APPLY ID                EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        CALLER
+  apply-sharded-d5e6f7g8  -               inventory-db  production  us-east     Running  4 minutes ago  octocat
+
+Use 'schemabot status <apply_id>' to view details
 
 ```
 </details>
@@ -6664,12 +6688,16 @@ Apply ID: apply-multi-a1b2c3d4
 Environment: production
 
 🟢 us-east — ready for cutover — next in order (orders-us-east)
+  External operation ID: remote-op-us-east-001
+  External apply ID: remote-apply-us-east-001
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
 
 
 🔄 eu-west — running table copy (orders-eu-west)
+  External operation ID: remote-op-eu-west-001
+  External apply ID: remote-apply-eu-west-001
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32);

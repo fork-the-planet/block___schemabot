@@ -4648,6 +4648,11 @@ func TestStartHandler(t *testing.T) {
 				wantMessage: "use revert or skip-revert",
 			},
 			{
+				name:        "paused",
+				applyState:  state.Apply.Paused,
+				wantMessage: "paused after a failed deployment; use release",
+			},
+			{
 				name:        "preparing branch",
 				applyState:  state.Apply.PreparingBranch,
 				wantMessage: "setup state preparing_branch",

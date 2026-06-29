@@ -583,7 +583,11 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	ps := &atomicPollState{lastProgressLog: time.Now()}
+	// Seed revertSkipped from the durable signal so a driver that picks this apply
+	// up after a restart treats skip-revert as already accepted: it won't re-attempt
+	// SkipRevert, and it keeps surfacing skipping_revert while finalization is in
+	// flight rather than falling back to revert_window.
+	ps := &atomicPollState{lastProgressLog: time.Now(), revertSkipped: apply.RevertSkippedAt != nil}
 
 	for {
 		select {
@@ -782,7 +786,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			c.markRevertSkipped(ctx, apply)
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
-			"Skip-revert triggered (--skip-revert)", state.Apply.RevertWindow, "")
+			"Skip-revert triggered (--skip-revert)", state.Apply.RevertWindow, state.Apply.SkippingRevert)
 		ps.revertSkipped = true
 	}
 
@@ -805,7 +809,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 					c.logger.Warn("failed to complete skip-revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
 				}
 				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
-					fmt.Sprintf("Skip-revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(pending))), state.Apply.RevertWindow, "")
+					fmt.Sprintf("Skip-revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(pending))), state.Apply.RevertWindow, state.Apply.SkippingRevert)
 			}
 		}
 	}
@@ -823,7 +827,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			} else {
 				c.markRevertSkipped(ctx, apply)
 				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
-					"Revert window expired, skip-revert triggered", state.Apply.RevertWindow, "")
+					"Revert window expired, skip-revert triggered", state.Apply.RevertWindow, state.Apply.SkippingRevert)
 			}
 			ps.revertSkipped = true
 		}
@@ -868,6 +872,15 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		apply.State = state.DeriveApplyState([]string{newState})
 	} else if derived, ok := c.deriveAggregateApplyState(ctx, apply, tasks); ok {
 		apply.State = derived
+	}
+	// Once skip-revert has been accepted, PlanetScale keeps reporting
+	// complete_pending_revert (which derives to revert_window) until it finishes
+	// discarding the staged revert. Surface that finalization as skipping_revert so
+	// the comment and CLI stop offering a resumable revert window and show that the
+	// change is being made permanent. It clears on its own: when the engine reports
+	// complete the aggregate derives completed and this override no longer applies.
+	if ps.revertSkipped && state.IsState(apply.State, state.Apply.RevertWindow) {
+		apply.State = state.Apply.SkippingRevert
 	}
 	apply.UpdatedAt = now
 	freshApply, err := c.storage.Applies().Get(ctx, apply.ID)

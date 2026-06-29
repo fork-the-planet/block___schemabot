@@ -113,6 +113,26 @@ func RenderStartCommandAccepted(data StartCommandAcceptedData) string {
 	return body
 }
 
+// SkipRevertCommandAcceptedData contains data for a PR comment skip-revert acknowledgement.
+type SkipRevertCommandAcceptedData struct {
+	ApplyID     string
+	Environment string
+	RequestedBy string
+}
+
+// RenderSkipRevertCommandAccepted renders the acknowledgement posted when a PR
+// comment skip-revert command records durable skip-revert intent.
+func RenderSkipRevertCommandAccepted(data SkipRevertCommandAcceptedData) string {
+	body := "## Skip-Revert Request Accepted\n\n" +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
+		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	body += "\nSkip-revert requested. SchemaBot will close the revert window, making this schema change permanent; status remains available from the PR progress comment or CLI.\n"
+	return body
+}
+
 // PreviewCommentStartCommandAccepted renders a sample start command
 // acknowledgement comment.
 func PreviewCommentStartCommandAccepted() string {

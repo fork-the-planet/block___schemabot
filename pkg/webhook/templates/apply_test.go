@@ -338,7 +338,7 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "📊 1/3 complete")
 	assert.Contains(t, result, "1 running (45%)")
 	assert.Contains(t, result, "1 queued")
-	assert.Contains(t, result, "### Table Progress")
+	assert.Contains(t, result, "**`users`**")
 
 	// Per-table checks
 	assert.Contains(t, result, "**`orders`**")
@@ -353,6 +353,36 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 
 	assert.Contains(t, result, "**`products`**")
 	assert.Contains(t, result, "Queued")
+}
+
+// A Vitess/PlanetScale apply labels its namespace group "Keyspace" (not "Schema"),
+// so the engine-aware label selection is exercised distinctly from the MySQL case.
+func TestRenderApplyStatusComment_VitessUsesKeyspaceLabel(t *testing.T) {
+	result := RenderApplyStatusComment(ApplyStatusCommentData{
+		Database:    "boardgames",
+		Environment: "staging",
+		Engine:      "PlanetScale",
+		ApplyID:     "apply-abc",
+		State:       state.Apply.Running,
+		Tables: []TableProgressData{
+			{TableName: "customers", Namespace: "boardgames_sharded", Status: state.Task.Running},
+		},
+	})
+	assert.Contains(t, result, "**Keyspace `boardgames_sharded`**")
+}
+
+// The "default" namespace placeholder and the empty namespace both mean "no
+// specific namespace": they fold into a single group with no namespace string,
+// so the comment renders no meaningless "default" header and never splits the
+// same logical no-namespace tables apart.
+func TestGroupTablesByNamespaceFoldsDefaultPlaceholder(t *testing.T) {
+	groups := groupTablesByNamespace([]TableProgressData{
+		{TableName: "a", Namespace: ""},
+		{TableName: "b", Namespace: "default"},
+	})
+	require.Len(t, groups, 1)
+	assert.Equal(t, "", groups[0].namespace)
+	assert.Len(t, groups[0].tables, 2)
 }
 
 // A Vitess apply surfaces each keyspace's VSchema application status (and diff)
@@ -548,10 +578,10 @@ func TestRenderApplyStatusComment_DeployRequestLink(t *testing.T) {
 	withURL := base
 	withURL.DeployRequestURL = "https://app.planetscale.com/block-staging/boardgames/deploy-requests/103"
 	result := RenderApplyStatusComment(withURL)
-	assert.Contains(t, result, "🔗 **Deploy request**: https://app.planetscale.com/block-staging/boardgames/deploy-requests/103")
+	assert.Contains(t, result, "Deploy request: https://app.planetscale.com/block-staging/boardgames/deploy-requests/103")
 
 	// No deploy request yet — no link line.
-	assert.NotContains(t, RenderApplyStatusComment(base), "Deploy request**:")
+	assert.NotContains(t, RenderApplyStatusComment(base), "Deploy request:")
 }
 
 func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
@@ -662,7 +692,7 @@ func TestRenderApplyStatusComment_Completed(t *testing.T) {
 
 	assert.Contains(t, result, "## Schema Change Status — Staging")
 	assert.Contains(t, result, "**Status**: Applied")
-	assert.Contains(t, result, "### Table Progress")
+	assert.Contains(t, result, "**`orders`**")
 	// Progress summary line
 	assert.Contains(t, result, "📊 2/2 complete")
 	// Each table has "✓ Complete" = 2 total
@@ -695,7 +725,7 @@ func TestRenderApplyStatusComment_SQLFencesAreTopLevel(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "### Table Progress")
+	assert.Contains(t, result, "**`example_cursor`**")
 	assert.NotContains(t, result, "\n- **`")
 	assert.NotContains(t, result, "\n  ```sql")
 	assert.NotContains(t, result, "\n  CREATE TABLE")
@@ -1032,7 +1062,6 @@ func TestRenderApplyStatusComment_NoTables(t *testing.T) {
 	result := RenderApplyStatusComment(data)
 
 	assert.Contains(t, result, "## Schema Change In Progress")
-	assert.NotContains(t, result, "### Table Progress")
 }
 
 func TestRenderApplyStatusComment_NoRequestedBy(t *testing.T) {
@@ -1157,7 +1186,7 @@ func TestPreviewCommentApplyProgress(t *testing.T) {
 	result := PreviewCommentApplyProgress()
 
 	assert.Contains(t, result, "Schema Change In Progress")
-	assert.Contains(t, result, "### Table Progress")
+	assert.Contains(t, result, "**Schema `testapp`**")
 	assert.Contains(t, result, "**`orders`**")
 	assert.Contains(t, result, "**`users`**")
 	assert.Contains(t, result, "**`products`**")
@@ -1181,7 +1210,7 @@ func TestPreviewCommentApplyCompleted(t *testing.T) {
 
 	assert.Contains(t, result, "Schema Change Status")
 	assert.Contains(t, result, "**Status**: Applied")
-	assert.Contains(t, result, "### Table Progress")
+	assert.Contains(t, result, "**Schema `testapp`**")
 }
 
 func TestPreviewCommentApplyFailed(t *testing.T) {

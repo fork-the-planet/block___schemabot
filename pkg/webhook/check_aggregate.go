@@ -240,22 +240,84 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 	return title, summary
 }
 
-// buildAggregateTable builds a markdown table showing the status of each per-database check.
-// Truncates to stay within GitHub's check run output limits.
+// isParticipantCheck reports whether a check is a participant deployment's
+// outcome folded into the leader's aggregate, rather than one of the leader's
+// own per-database checks. Participant outcomes carry the aggregate sentinel as
+// their database type and the tenant name as their database name.
+func isParticipantCheck(c *storage.Check) bool {
+	return c.DatabaseType == aggregateSentinel && c.DatabaseName != aggregateSentinel
+}
+
+// buildAggregateTable renders the aggregate check's summary: the leader's own
+// per-database checks in a Database table, and — when the leader gates on
+// participant deployments — each participant's rolled-up status in a separate
+// Tenant deployments table, so a reader can tell "my databases" from "the other
+// tenants I'm gating on" at a glance. Participant gating is the key information,
+// so the Tenant deployments section is rendered first and its size reserved: it
+// is never dropped, even when many per-database rows would otherwise fill the
+// Check Run text limit — those rows truncate instead.
 func buildAggregateTable(checks []*storage.Check) string {
+	var dbChecks, participantChecks []*storage.Check
+	for _, c := range checks {
+		if isParticipantCheck(c) {
+			participantChecks = append(participantChecks, c)
+		} else {
+			dbChecks = append(dbChecks, c)
+		}
+	}
+
+	tenantSection := renderParticipantSection(participantChecks)
+	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-len(tenantSection))
+
+	var sb strings.Builder
+	sb.WriteString(dbSection)
+	if tenantSection != "" {
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(tenantSection)
+	}
+	return sb.String()
+}
+
+// renderDatabaseSection renders the leader's own per-database checks as a
+// Database table, truncating to stay within budget bytes.
+func renderDatabaseSection(dbChecks []*storage.Check, budget int) string {
+	if len(dbChecks) == 0 {
+		return ""
+	}
 	var sb strings.Builder
 	sb.WriteString("| Database | Environment | Status |\n")
 	sb.WriteString("|----------|-------------|--------|\n")
-
-	for i, c := range checks {
+	for i, c := range dbChecks {
 		row := fmt.Sprintf("| `%s` | %s | %s |\n", c.DatabaseName, c.Environment, checkStatusLabel(c))
-		if sb.Len()+len(row) > maxCheckRunTextLength-1000 {
-			fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(checks)-i)
+		if sb.Len()+len(row) > budget {
+			fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(dbChecks)-i)
 			break
 		}
 		sb.WriteString(row)
 	}
+	return sb.String()
+}
 
+// renderParticipantSection renders the folded participant deployments as a
+// Tenant table keyed by tenant, truncating within the Check Run text limit.
+func renderParticipantSection(participantChecks []*storage.Check) string {
+	if len(participantChecks) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("**Tenant deployments**\n\n")
+	sb.WriteString("| Tenant | Status |\n")
+	sb.WriteString("|--------|--------|\n")
+	for i, c := range participantChecks {
+		row := fmt.Sprintf("| `%s` | %s |\n", c.DatabaseName, checkStatusLabel(c))
+		if sb.Len()+len(row) > maxCheckRunTextLength-1000 {
+			fmt.Fprintf(&sb, "\n... and %d more tenant(s)\n", len(participantChecks)-i)
+			break
+		}
+		sb.WriteString(row)
+	}
 	return sb.String()
 }
 

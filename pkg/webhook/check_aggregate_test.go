@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -152,6 +153,57 @@ func TestAggregateSummary(t *testing.T) {
 	assert.Contains(t, summary, "production")
 	assert.Contains(t, summary, "Applied")
 	assert.Contains(t, summary, "Pending")
+}
+
+// When the leader gates on participant deployments, their folded outcomes render
+// in a separate "Tenant deployments" section, keyed by tenant, distinct from the
+// leader's own per-database rows.
+func TestAggregateSummary_WithParticipants(t *testing.T) {
+	checks := []*storage.Check{
+		{DatabaseType: "mysql", DatabaseName: "orders", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true},
+		{DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired},
+		{DatabaseType: aggregateSentinel, DatabaseName: "tenant-c", Environment: "production", Status: checkStatusInProgress},
+	}
+
+	_, summary := aggregateSummary(checks, checkConclusionActionRequired)
+
+	dbSection, tenantSection, found := strings.Cut(summary, "**Tenant deployments**")
+	require.True(t, found, "summary has a Tenant deployments section")
+
+	// The leader's own database renders in the Database section; participants do not.
+	assert.Contains(t, dbSection, "| Database | Environment | Status |")
+	assert.Contains(t, dbSection, "`orders`")
+	assert.NotContains(t, dbSection, "tenant-b", "participants must not appear in the Database section")
+	assert.NotContains(t, dbSection, "tenant-c")
+
+	// Participants render in their own tenant-keyed section.
+	assert.Contains(t, tenantSection, "| Tenant | Status |")
+	assert.Contains(t, tenantSection, "`tenant-b`")
+	assert.Contains(t, tenantSection, "`tenant-c`")
+}
+
+// Participant gating is the key information, so the Tenant deployments section
+// must survive even when the leader has so many per-database checks that the
+// Database section truncates.
+func TestAggregateSummary_TenantSectionSurvivesDatabaseTruncation(t *testing.T) {
+	var checks []*storage.Check
+	for range 6000 {
+		checks = append(checks, &storage.Check{
+			DatabaseType: "mysql", DatabaseName: "orders", Environment: "production",
+			Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired,
+		})
+	}
+	checks = append(checks, &storage.Check{
+		DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Environment: "production",
+		Status: checkStatusInProgress,
+	})
+
+	_, summary := aggregateSummary(checks, checkStatusInProgress)
+
+	assert.Less(t, len(summary), maxCheckRunTextLength, "summary stays under the Check Run limit")
+	assert.Contains(t, summary, "more check(s)", "the Database section truncates")
+	assert.Contains(t, summary, "**Tenant deployments**", "the tenant section is not dropped")
+	assert.Contains(t, summary, "`tenant-b`", "the participant still appears despite database truncation")
 }
 
 func TestAggregateSummary_AllSuccess(t *testing.T) {

@@ -280,17 +280,44 @@ func buildAggregateTable(checks []*storage.Check) string {
 	return sb.String()
 }
 
+// changeSummaryLabel returns the per-database change summary for the aggregate
+// check's Change column, or an em dash when no summary was recorded (aggregate
+// rows, or rows recorded before the summary was stored).
+func changeSummaryLabel(c *storage.Check) string {
+	if c.ChangeSummary == "" {
+		return "—"
+	}
+	return c.ChangeSummary
+}
+
 // renderDatabaseSection renders the leader's own per-database checks as a
-// Database table, truncating to stay within budget bytes.
+// Database table with each database's type, change summary, and status,
+// truncating to stay within budget bytes. Per-environment aggregates contain a
+// single environment, so the environment is not repeated per row. The global
+// aggregate (no allowed_environments) can fold databases from several
+// environments into one table, so an Environment column is added when the rows
+// span more than one environment — otherwise staging and production rows for the
+// same database would be indistinguishable.
 func renderDatabaseSection(dbChecks []*storage.Check, budget int) string {
 	if len(dbChecks) == 0 {
 		return ""
 	}
+	showEnv := hasMultipleEnvironments(dbChecks)
 	var sb strings.Builder
-	sb.WriteString("| Database | Environment | Status |\n")
-	sb.WriteString("|----------|-------------|--------|\n")
+	if showEnv {
+		sb.WriteString("| Database | Environment | Type | Change | Status |\n")
+		sb.WriteString("|----------|-------------|------|--------|--------|\n")
+	} else {
+		sb.WriteString("| Database | Type | Change | Status |\n")
+		sb.WriteString("|----------|------|--------|--------|\n")
+	}
 	for i, c := range dbChecks {
-		row := fmt.Sprintf("| `%s` | %s | %s |\n", c.DatabaseName, c.Environment, checkStatusLabel(c))
+		var row string
+		if showEnv {
+			row = fmt.Sprintf("| `%s` | %s | %s | %s | %s |\n", c.DatabaseName, c.Environment, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c))
+		} else {
+			row = fmt.Sprintf("| `%s` | %s | %s | %s |\n", c.DatabaseName, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c))
+		}
 		if sb.Len()+len(row) > budget {
 			fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(dbChecks)-i)
 			break
@@ -298,6 +325,20 @@ func renderDatabaseSection(dbChecks []*storage.Check, budget int) string {
 		sb.WriteString(row)
 	}
 	return sb.String()
+}
+
+// hasMultipleEnvironments reports whether the per-database checks span more than
+// one distinct environment, which happens for the global aggregate that is not
+// scoped to a single environment.
+func hasMultipleEnvironments(dbChecks []*storage.Check) bool {
+	seen := make(map[string]struct{}, 2)
+	for _, c := range dbChecks {
+		seen[c.Environment] = struct{}{}
+		if len(seen) > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // renderParticipantSection renders the folded participant deployments as a

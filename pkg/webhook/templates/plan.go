@@ -318,6 +318,48 @@ func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 	}
 }
 
+// SummarizeChanges renders a compact one-line summary of a plan's changes for
+// the aggregate check's Change column, e.g. "5 creates, 3 alters, 1 drop ·
+// 2 vschema updates". Each category is a pluralized noun so the phrasing stays
+// consistent with the vschema clause. Zero categories are omitted. The vschema
+// clause is only included for non-MySQL engines, matching the plan comment's
+// summary. Returns "" only when the plan has no changes at all. The
+// create/alter/drop and vschema counting is identical to the plan comment's
+// summary (countStatementTypes / countChanges) so the two always agree.
+func SummarizeChanges(data PlanCommentData) string {
+	creates, alters, drops := countStatementTypes(data.Changes)
+	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
+
+	var parts []string
+	if creates > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", creates, pluralize("create", creates)))
+	}
+	if alters > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", alters, pluralize("alter", alters)))
+	}
+	if drops > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", drops, pluralize("drop", drops)))
+	}
+	ddlSummary := strings.Join(parts, ", ")
+
+	// Fallback matching the plan comment: statements that classify as none of
+	// create/alter/drop — or per-shard-only DDL that countStatementTypes does not
+	// walk — still count. Report the raw statement total so the Change column
+	// never implies "no changes" for a plan that has them.
+	if ddlSummary == "" && totalStatements > 0 {
+		ddlSummary = fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements))
+	}
+
+	if keyspacesWithVSchema > 0 && !data.IsMySQL {
+		vschemaSummary := fmt.Sprintf("%d vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema))
+		if ddlSummary == "" {
+			return vschemaSummary
+		}
+		return ddlSummary + " · " + vschemaSummary
+	}
+	return ddlSummary
+}
+
 // countStatementTypes counts CREATE, ALTER, and DROP statements across all keyspaces.
 func countStatementTypes(changes []KeyspaceChangeData) (creates, alters, drops int) {
 	for _, ks := range changes {

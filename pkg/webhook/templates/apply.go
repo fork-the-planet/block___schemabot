@@ -98,17 +98,15 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 
 	// Metadata line
 	writeApplyMetadata(&sb, data, renderedAt)
-	writeApplyStatusDetail(&sb, data.State)
+
+	// Status line. For the revert window it carries the countdown to permanence
+	// inline (e.g. "Revert Window | Closes in 28m 30s") so the operator sees the
+	// state and its deadline in one place rather than on a separate line.
+	writeApplyStatusDetail(&sb, data)
 
 	// Deploy-request link (PlanetScale) — the operator's entry point into the
 	// deploy request's own progress, which the comment does not otherwise surface.
 	writeDeployRequestLink(&sb, data)
-
-	// Revert-window countdown (PlanetScale) — how long until the change becomes
-	// permanent, so the operator knows the window to revert or skip.
-	if state.IsState(data.State, state.Apply.RevertWindow) {
-		writeRevertWindowDeadline(&sb, data.RevertExpiresAt)
-	}
 
 	// Cutover readiness summary
 	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
@@ -196,10 +194,15 @@ func startedAtDisplay(startedAt, fallback string) string {
 	return t.UTC().Format("2006-01-02 15:04:05 UTC")
 }
 
-func writeApplyStatusDetail(sb *strings.Builder, applyState string) {
-	detail := applyStatusDetail(applyState)
+func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
+	detail := applyStatusDetail(data.State)
 	if detail == "" {
 		return
+	}
+	if state.IsState(data.State, state.Apply.RevertWindow) {
+		if countdown := revertWindowCountdown(data.RevertExpiresAt); countdown != "" {
+			detail += " | " + countdown
+		}
 	}
 	fmt.Fprintf(sb, "\n**Status**: %s\n", detail)
 }
@@ -217,6 +220,8 @@ func applyStatusDetail(applyState string) string {
 		return "Reverted"
 	case state.Apply.Cancelled:
 		return "Cancelled"
+	case state.Apply.RevertWindow:
+		return "Revert Window"
 	case state.Apply.Pending:
 		return "Starting"
 	case state.Apply.Running, state.Apply.RunningDegraded:
@@ -278,24 +283,24 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 	writeFooterAction(sb, prefix, fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment))
 }
 
-// writeRevertWindowDeadline writes the time remaining before the revert window
-// closes, when a deadline is known and still in the future. An unset or
-// past-due deadline renders nothing so the comment never shows a stale or
-// negative countdown.
-func writeRevertWindowDeadline(sb *strings.Builder, revertExpiresAt string) {
+// revertWindowCountdown returns the time remaining before the revert window
+// closes, phrased for the status line (e.g. "Closes in 28m 30s"). It returns ""
+// when the deadline is unset, unparseable, or already past, so the status line
+// never shows a stale or negative countdown.
+func revertWindowCountdown(revertExpiresAt string) string {
 	if revertExpiresAt == "" {
-		return
+		return ""
 	}
 	expires, err := time.Parse(time.RFC3339, revertExpiresAt)
 	if err != nil {
-		return
+		return ""
 	}
 	// NowFunc (not time.Now) so previews and tests render a deterministic countdown.
 	remaining := expires.Sub(NowFunc())
 	if remaining <= 0 {
-		return
+		return ""
 	}
-	fmt.Fprintf(sb, "\n⏳ **Revert window closes in**: %s\n", formatDuration(remaining))
+	return fmt.Sprintf("Closes in %s", formatDuration(remaining))
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,
@@ -900,8 +905,9 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Failed:
 		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
 	case state.Apply.RevertWindow:
-		writeFooterAction(sb, "To revert:", fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment))
-		fmt.Fprintf(sb, "\nTo skip revert and keep changes:\n```\nschemabot skip-revert %s -e %s\n```\n", data.ApplyID, data.Environment)
+		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
+		writeFooterAction(sb, "To skip revert and keep changes:", fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment))
+		fmt.Fprintf(sb, "\nTo revert:\n```\nschemabot revert %s -e %s\n```\n", data.ApplyID, data.Environment)
 	case state.Apply.SkippingRevert:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.\n")

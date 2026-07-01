@@ -42,20 +42,65 @@ func TestSkipUnownedUnscopedCommand(t *testing.T) {
 		"a real error is not the not-owned case and must still surface")
 }
 
-// Fan-out applies only to actionable unscoped commands. A complete command
-// (Found) fans out; a plan without -e fans out as a multi-env plan; but a
-// missing-env error for apply/rollback does NOT fan out — otherwise every
-// participant on a shared repo would post its own duplicate "missing
-// environment" comment (the leader posts that error once).
+// On an aggregate repo an unscoped command fans out to every deployment, so a
+// deployment that finds no pending work (e.g. apply-confirm after its own
+// databases already auto-applied) stays silent instead of posting noise. A
+// -t-scoped command named a specific deployment, so its "nothing to do" answer
+// still surfaces; a non-aggregate repo is a single deployment whose answer is
+// useful too.
+func TestSilentOnUnscopedFanOut(t *testing.T) {
+	cfg := &api.ServerConfig{Repos: map[string]api.RepoConfig{
+		"octocat/participant-repo": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+		"octocat/leader-repo": {Aggregate: &api.AggregateConfig{
+			Role:            api.AggregateRoleLeader,
+			ExpectedTenants: []api.ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"tenant-b/schema"}, CheckName: "SchemaBot Tenant B"}},
+		}},
+		"octocat/plain-repo": {},
+	}}
+	h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+	assert.True(t, h.silentOnUnscopedFanOut("octocat/participant-repo", ""),
+		"a participant with nothing pending stays silent on an unscoped fan-out")
+	assert.True(t, h.silentOnUnscopedFanOut("octocat/leader-repo", ""),
+		"a leader with nothing pending stays silent on an unscoped fan-out")
+	assert.False(t, h.silentOnUnscopedFanOut("octocat/participant-repo", "tenant-b"),
+		"a -t-scoped command named a deployment, so its nothing-to-do answer surfaces")
+	assert.False(t, h.silentOnUnscopedFanOut("octocat/plain-repo", ""),
+		"a non-aggregate repo is a single deployment — its answer is useful")
+	assert.False(t, h.silentOnUnscopedFanOut("octocat/unknown-repo", ""),
+		"an unconfigured repo has no aggregate role — its answer is useful")
+}
+
+// Fan-out applies only to unscoped commands a participant can serve on its own
+// databases: plan, apply, apply-confirm, and unlock. A complete command (Found)
+// fans out; a plan without -e fans out as a multi-env plan; but a missing-env
+// apply does NOT fan out — otherwise every participant on a shared repo would
+// post its own duplicate "missing environment" comment (the leader posts that
+// error once). Commands that target a single apply owned by one tenant —
+// rollback and the lifecycle controls — never fan out; they require an explicit
+// -t so only the owning tenant acts instead of every participant reporting
+// "apply not found".
 func TestUnscopedCommandFansOut(t *testing.T) {
 	assert.True(t, unscopedCommandFansOut(CommandResult{Found: true, Action: action.Apply}),
-		"a complete command fans out")
+		"a complete apply fans out")
+	assert.True(t, unscopedCommandFansOut(CommandResult{Found: true, Action: action.ApplyConfirm}),
+		"apply-confirm fans out with apply: it is the confirmation step of the same per-participant flow")
 	assert.True(t, unscopedCommandFansOut(CommandResult{MissingEnv: true, Action: action.Plan}),
 		"plan without -e fans out as a multi-env plan")
+	assert.True(t, unscopedCommandFansOut(CommandResult{Found: true, Action: action.Unlock}),
+		"unlock fans out: it releases only this participant's own database locks")
 	assert.False(t, unscopedCommandFansOut(CommandResult{MissingEnv: true, Action: action.Apply}),
 		"apply without -e is an error and must not fan out (no duplicate missing-env comments)")
-	assert.False(t, unscopedCommandFansOut(CommandResult{MissingEnv: true, Action: action.Rollback}),
-		"rollback without -e is an error and must not fan out")
+
+	// Commands targeting a single owned apply require an explicit -t.
+	for _, a := range []string{
+		action.Rollback, action.RollbackConfirm, action.Stop, action.Cancel,
+		action.Start, action.Release, action.Cutover, action.SkipRevert, action.Revert,
+	} {
+		assert.False(t, unscopedCommandFansOut(CommandResult{Found: true, Action: a}),
+			"%s targets a single owned apply and must require -t", a)
+	}
+
 	assert.False(t, unscopedCommandFansOut(CommandResult{}),
 		"an unrecognized command does not fan out")
 }

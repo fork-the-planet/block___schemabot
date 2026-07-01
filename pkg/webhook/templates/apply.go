@@ -138,39 +138,23 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	return sb.String()
 }
 
+// writeApplyStatusHeader writes the headline for an in-place apply status
+// comment. The title is intentionally state-independent — always "Schema Change
+// Status — <env>" — so the headline stays stable as the apply moves through its
+// states (running → revert window → applied); the current state is conveyed by
+// the Status line and the per-table progress, not the headline. The single-,
+// multi-deployment, and sharded status comments all use this so their headline
+// vocabulary is identical. Terminal summary/notification comments use
+// writeApplyHeader, which keeps a state-specific title.
 func writeApplyStatusHeader(sb *strings.Builder, data ApplyStatusCommentData) {
-	if state.IsTerminalApplyState(data.State) {
-		writeEnvironmentTitle(sb, "Schema Change Status", data.Environment)
-		return
-	}
-	writeApplyHeader(sb, data)
+	writeEnvironmentTitle(sb, "Schema Change Status", data.Environment)
 }
 
-// writeApplyHeader writes the comment header with a state-specific title.
+// writeApplyHeader writes the state-specific title for a terminal summary or
+// notification comment (the separate comment posted when an apply reaches a
+// terminal state), distinct from the stable in-place status headline.
 func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
-	case state.Apply.Pending,
-		state.Apply.Running,
-		state.Apply.RunningDegraded,
-		state.Apply.FailedRetryable,
-		state.Apply.WaitingForDeploy,
-		state.Apply.WaitingForCutover,
-		state.Apply.Recovering,
-		state.Apply.Resuming,
-		state.Apply.CuttingOver,
-		state.Apply.PreparingBranch,
-		state.Apply.ApplyingBranchChanges,
-		state.Apply.ValidatingBranch,
-		state.Apply.CreatingDeployRequest,
-		state.Apply.ValidatingDeployRequest:
-		// running_degraded is a continue rollout still in flight past a failed
-		// sibling: the change is still in progress, and the failed deployment is
-		// surfaced in the per-deployment breakdown, not the headline.
-		writeEnvironmentTitle(sb, "Schema Change In Progress", data.Environment)
-	case state.Apply.RevertWindow:
-		writeEnvironmentTitle(sb, "Schema Change Applied (Pending Revert)", data.Environment)
-	case state.Apply.SkippingRevert:
-		writeEnvironmentTitle(sb, "Skipping Revert — Finalizing", data.Environment)
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
@@ -182,11 +166,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Cancelled:
 		writeEnvironmentTitle(sb, "🚫 Schema Change Cancelled", data.Environment)
 	default:
-		if state.IsTerminalApplyState(data.State) {
-			writeEnvironmentTitle(sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
-		} else {
-			writeEnvironmentTitle(sb, "Schema Change In Progress", data.Environment)
-		}
+		writeEnvironmentTitle(sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
 	}
 }
 
@@ -239,6 +219,10 @@ func applyStatusDetail(applyState string) string {
 		return "Cancelled"
 	case state.Apply.Pending:
 		return "Starting"
+	case state.Apply.Running, state.Apply.RunningDegraded:
+		return "In Progress"
+	case state.Apply.FailedRetryable:
+		return "Retrying"
 	case state.Apply.WaitingForDeploy:
 		return "Waiting for Deploy"
 	case state.Apply.WaitingForCutover:
@@ -260,7 +244,7 @@ func applyStatusDetail(applyState string) string {
 	case state.Apply.ValidatingDeployRequest:
 		return "Validating Deploy Request"
 	default:
-		if applyState == "" || state.IsTerminalApplyState(applyState) || state.IsState(applyState, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.FailedRetryable) {
+		if applyState == "" || state.IsTerminalApplyState(applyState) {
 			return ""
 		}
 		return humanizeState(applyState)
@@ -1110,7 +1094,7 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 
 	fmt.Fprintf(sb, "\n<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(data))
 	if data.ApplyID != "" {
-		fmt.Fprintf(sb, "**Apply ID**: `%s`\n\n", data.ApplyID)
+		fmt.Fprintf(sb, "_Apply ID: `%s`_\n\n", data.ApplyID)
 	}
 	writeCompletedNamespaceSummary(sb, data)
 	if len(data.Tables) > 0 {
@@ -1257,6 +1241,16 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 	}
 
 	collapsed := collapseNamespaceGroups && len(data.Tables) > 5
+	// Per-namespace status emojis only carry information when outcomes differ
+	// across namespaces (some failed, some succeeded). When every namespace
+	// succeeded, the repeated ✅ is noise, so the headers omit the emoji.
+	showGroupEmoji := false
+	for _, g := range groups {
+		if groupStateEmoji(g.tables) != "✅" {
+			showGroupEmoji = true
+			break
+		}
+	}
 	// Skip namespace header when there's only one group and it's "default" or
 	// matches the database name — the header is redundant with the metadata line.
 	singleGroup := len(groups) == 1
@@ -1270,13 +1264,16 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 				header = data.Database
 			}
 
-			groupEmoji := groupStateEmoji(g.tables)
+			emojiPrefix := ""
+			if showGroupEmoji {
+				emojiPrefix = groupStateEmoji(g.tables) + " "
+			}
 
 			if groupCollapsed {
 				sb.WriteString("\n<details><summary>")
-				fmt.Fprintf(sb, "%s <strong>%s</strong> (%d tables)</summary>\n\n", groupEmoji, header, len(g.tables))
+				fmt.Fprintf(sb, "%s<strong>%s</strong> (%d tables)</summary>\n\n", emojiPrefix, header, len(g.tables))
 			} else {
-				fmt.Fprintf(sb, "\n### %s %s\n\n", groupEmoji, header)
+				fmt.Fprintf(sb, "\n### %s%s\n\n", emojiPrefix, header)
 			}
 		} else {
 			sb.WriteString("\n")

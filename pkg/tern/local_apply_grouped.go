@@ -843,9 +843,34 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
+	// A durable revert control request (the interactive "revert" command) was
+	// queued; honor it. This is the apply owner's retry path: the API's immediate
+	// revert attempt may have failed or its process may have died, leaving the
+	// request pending for the drive.
+	revertedByControlRequest := false
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped {
+		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
+			c.logger.Warn("could not load pending revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
+		} else if pending != nil {
+			c.logger.Info("revert requested by user; reverting schema change", "apply_id", apply.ApplyIdentifier, "requested_by", controlRequestCaller(pending))
+			if _, err := eng.Revert(ctx, controlReq); err != nil {
+				// Leave the request pending so the next drive tick retries.
+				c.logger.Error("revert (control request) failed; will retry", "error", err, "apply_id", apply.ApplyIdentifier)
+			} else {
+				revertedByControlRequest = true
+				if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
+					c.logger.Warn("failed to complete revert control request", "apply_id", apply.ApplyIdentifier, "error", err)
+				}
+				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventRevertTriggered, storage.LogSourceSchemaBot,
+					fmt.Sprintf("Revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(pending))), state.Apply.RevertWindow, state.Apply.Reverting)
+			}
+		}
+	}
+
 	// Revert window enabled (default): auto-skip based on deployed_at + configured duration.
-	// Falls back to stateEnteredAt if deployed_at is unavailable.
-	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped {
+	// Falls back to stateEnteredAt if deployed_at is unavailable. A user revert
+	// this tick takes precedence — do not also auto-skip the window shut.
+	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped && !revertedByControlRequest {
 		revertDeadline := c.revertWindowDeadline(result.ResumeState, ps.stateEnteredAt)
 		if !revertDeadline.IsZero() && now.After(revertDeadline) {
 			c.logger.Info("revert window expired, skipping", "apply_id", apply.ApplyIdentifier, "deadline", revertDeadline)
@@ -928,8 +953,8 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"stored_state", freshApply.State,
 			"progress_state", apply.State)
 		*apply = *freshApply
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			c.logger.Warn("failed to complete pending stop request for terminal apply; current apply owner will exit for operator retry",
+		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending control requests for terminal apply; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return true
 		}
@@ -975,8 +1000,8 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				"apply_id", apply.ApplyIdentifier, "expected_state", expectedState, "derived_state", apply.State)
 			return true
 		}
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			c.logger.Warn("failed to complete pending stop request after terminal progress reconciliation; current apply owner will exit for operator retry",
+		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending control requests after terminal progress reconciliation; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return true
 		}

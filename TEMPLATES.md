@@ -683,7 +683,7 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 
 ---
 
-**⛔ Unsafe Changes Detected:**
+**⛔ 1 Unsafe Change Detected:**
 - `customers`: Unsafe operation detected: DROP COLUMN `nickname`
 
 **Destructive drop guidance:**
@@ -715,7 +715,7 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 
 ---
 
-**⛔ Unsafe Changes Detected:**
+**⛔ 1 Unsafe Change Detected:**
 - `customers`: Unsafe operation detected: DROP INDEX `idx_customers_email`
 
 **Destructive drop guidance:**
@@ -6130,7 +6130,7 @@ ALTER TABLE `mutes`
     DROP COLUMN `legacy_reason`;
 ```
 
-**⛔ Unsafe Changes Detected:**
+⚠️ **Issues**: **1** unsafe change detected
 - `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
 **Destructive drop guidance:**

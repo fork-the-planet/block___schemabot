@@ -150,12 +150,26 @@ type CheckStore interface {
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
 
-	// DeleteByPRExcludingApplyOwned removes stored check state for a PR,
-	// except rows owned by an in-flight apply (apply_id set and status
-	// in_progress). Used for cleanup when a PR is closed or merged:
-	// apply-owned rows must keep blocking until the apply reaches a terminal
-	// state, even across a close and reopen.
-	DeleteByPRExcludingApplyOwned(ctx context.Context, repo string, pr int) error
+	// DeleteByPRRetainingBlockingApplyOwned removes stored check state for a
+	// closed PR, retaining apply-owned rows the close must not unblock. Once
+	// an apply has started, its stored check state stays authoritative across
+	// a close and reopen until an operator reconciles the target environment.
+	// Plan-only rows (no apply_id) are always deleted. Apply-owned rows are
+	// handled by close kind:
+	//
+	//   - merged close: rows that are in_progress or whose conclusion is
+	//     anything but success are retained; rows that concluded successfully
+	//     are deleted, because the merged PR carries the applied schema and
+	//     nothing remains for the row to block.
+	//   - unmerged close: every apply-owned row is retained, including rows
+	//     whose conclusion is success. A stored success only proves the
+	//     database matched the PR when the row was last written — a commit
+	//     that removed the applied change may not have been reconciled into
+	//     the row yet, and the unmerged branch means the change never landed.
+	//     Reopen-time stale cleanup converges the retained row: it converts
+	//     it to action_required when the schema change is gone from the PR,
+	//     or a fresh plan result replaces it when the change is still present.
+	DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error
 }
 
 // SettingsStore manages admin-level SchemaBot settings (global config).

@@ -737,6 +737,56 @@ func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
 	return repoConfig.AdminTeams, repoConfig.AdminUsers
 }
 
+// SchemaDirHintsForRepo returns the configured schema directories of every
+// database that accepts changes from repo, sorted and deduplicated. Config
+// discovery uses these as probe targets when GitHub truncates the repository
+// tree (repos beyond the Trees API response cap), where a whole-repo scan is
+// impossible. A database with no allowed_repos restriction accepts any
+// trusted repo, so its directories are always included.
+//
+// exhaustive reports whether the returned directories cover every location a
+// policy-valid config could live in. A database with no allowed_dirs
+// restriction, or with a wildcard ("*") or repo-root (".") entry, accepts a
+// config in directories no hint list can cover — for such a repo the
+// truncated-tree fallback must keep failing closed, because a partial probe
+// could return a confidently wrong result (a single config where a full scan
+// would find several, or a "database not found" for a config that exists).
+func (c *ServerConfig) SchemaDirHintsForRepo(repo string) (dirs []string, exhaustive bool) {
+	seen := make(map[string]struct{})
+	exhaustive = true
+	for _, db := range c.Databases {
+		if len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo) {
+			continue
+		}
+		if len(db.AllowedDirs) == 0 {
+			// The allowed_dirs policy only restricts databases that configure
+			// it; this database accepts a config anywhere in the repo.
+			exhaustive = false
+			continue
+		}
+		for _, dir := range db.AllowedDirs {
+			// Normalize exactly like the allowed_dirs policy checks so the
+			// probed directories match what the policy would accept.
+			normalized, err := normalizeSchemaPath(dir)
+			if err != nil || normalized == "*" || normalized == "." {
+				// Wildcard and repo-root entries accept configs that no
+				// directory probe can cover. (Invalid entries are rejected at
+				// config load; treating them as non-exhaustive here costs
+				// nothing and stays fail-closed.)
+				exhaustive = false
+				continue
+			}
+			if _, ok := seen[normalized]; ok {
+				continue
+			}
+			seen[normalized] = struct{}{}
+			dirs = append(dirs, normalized)
+		}
+	}
+	slices.Sort(dirs)
+	return dirs, exhaustive
+}
+
 // DeploymentTarget is one entry in EnvironmentConfig.Deployments. It carries
 // the per-deployment override values for a multi-deployment environment. The
 // enclosing map key identifies the Tern deployment (and must also appear in

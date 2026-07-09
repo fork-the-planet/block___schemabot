@@ -770,6 +770,7 @@ schemabot apply -e staging --allow-unsafe
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
+| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
@@ -800,6 +801,7 @@ That command wasn't recognized. Available commands:
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
+| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
@@ -994,6 +996,7 @@ That command wasn't recognized. Available commands:
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
+| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
@@ -1860,6 +1863,37 @@ Schema changes are being applied. This comment will be updated with progress.
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: In Progress
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="single-table-running-volume-tuned"></a><strong>Single Table: Running (Volume Tuned)</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress | Volume: 8/11
 
 **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
 
@@ -2986,6 +3020,31 @@ Cutover request accepted. SchemaBot will complete this schema change; status rem
 
 Cutover is already in progress. SchemaBot will keep reporting progress from the existing apply.
 
+</details>
+
+<details>
+<summary><a name="volume-command-accepted"></a><strong>Volume Command Accepted</strong></summary>
+
+
+## Volume Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; the progress comment on this PR shows the current level.
+
+</details>
+
+<details>
+<summary><a name="volume-command-invalid-level"></a><strong>Volume Command Invalid Level</strong></summary>
+
+
+## Missing or Invalid Volume Level
+
+Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
+
+The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
 </details>
 
 <details>
@@ -5425,6 +5484,33 @@ Cutover request accepted. SchemaBot will complete this schema change; status rem
 
 Cutover is already in progress. SchemaBot will keep reporting progress from the existing apply.
 
+
+</details>
+
+<details>
+<summary><a name="volume-command-accepted"></a><strong>Volume Command Accepted</strong></summary>
+
+
+## Volume Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; the progress comment on this PR shows the current level.
+
+
+</details>
+
+<details>
+<summary><a name="volume-command-invalid-level"></a><strong>Volume Command Invalid Level</strong></summary>
+
+
+## Missing or Invalid Volume Level
+
+Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
+
+The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
 
 </details>
 

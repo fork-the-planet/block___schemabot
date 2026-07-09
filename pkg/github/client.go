@@ -589,6 +589,68 @@ type PullRequestInfo struct {
 	State string
 }
 
+// OpenPullRequest holds the PR metadata needed for operator scans.
+type OpenPullRequest struct {
+	Number  int
+	Title   string
+	HeadRef string
+	HeadSHA string
+	BaseRef string
+	User    string
+}
+
+// ListOpenPullRequestsPage lists one page of open pull requests in a
+// repository, newest updated first. page is 1-based (0 selects the first
+// page). nextPage is 0 when no further pages exist. Fetching one bounded page
+// per call lets operator scans run as many short requests instead of one
+// long one.
+func (ic *InstallationClient) ListOpenPullRequestsPage(ctx context.Context, repo string, page, perPage int) (prs []OpenPullRequest, nextPage int, err error) {
+	owner, repoName := splitRepo(repo)
+	if page <= 0 {
+		page = 1
+	}
+	// GitHub caps page size at 100; clamp so a caller's 0/negative/oversized
+	// value behaves predictably.
+	if perPage <= 0 || perPage > 100 {
+		perPage = 100
+	}
+	opts := &gh.PullRequestListOptions{
+		State:     "open",
+		Sort:      "updated",
+		Direction: "desc",
+		ListOptions: gh.ListOptions{
+			PerPage: perPage,
+			Page:    page,
+		},
+	}
+	var resp *gh.Response
+	ghPRs, err := retryGitHubUnavailableRead(ctx, ic.logger, "list open pull requests", []any{"repo", repo, "page", page}, func(ctx context.Context) ([]*gh.PullRequest, error) {
+		list, listResp, listErr := ic.client.PullRequests.List(ctx, owner, repoName, opts)
+		if listErr != nil {
+			return nil, classifyGitHubAPIError(listErr)
+		}
+		resp = listResp
+		return list, nil
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("list open pull requests for %s page %d: %w", repo, page, err)
+	}
+	for _, pr := range ghPRs {
+		prs = append(prs, OpenPullRequest{
+			Number:  pr.GetNumber(),
+			Title:   pr.GetTitle(),
+			HeadRef: pr.GetHead().GetRef(),
+			HeadSHA: pr.GetHead().GetSHA(),
+			BaseRef: pr.GetBase().GetRef(),
+			User:    pr.GetUser().GetLogin(),
+		})
+	}
+	if resp != nil {
+		nextPage = resp.NextPage
+	}
+	return prs, nextPage, nil
+}
+
 // IsClosed reports whether the PR is closed (merged or unmerged). Callers that
 // act on a PR asynchronously — timers, reconciliation — use this to stop work
 // that only makes sense on an open PR.

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -590,7 +591,7 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	// Wait for both passing aggregates (staging + production)
 	seen := map[string]bool{}
@@ -636,7 +637,10 @@ func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
 	})
 
 	// PR changed files — no schema files.
+	filesFetched := make(chan struct{})
+	var filesFetchedOnce sync.Once
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		filesFetchedOnce.Do(func() { close(filesFetched) })
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
 			{Filename: new("README.md"), Status: new("modified")},
 		})
@@ -672,10 +676,16 @@ func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "aggregate participant, staying silent")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
-	// The skip is synchronous (it returns before scheduling any passing
-	// aggregate), so a brief drain confirms no check run was posted.
+	// Wait until async config discovery reads the PR files, then drain
+	// briefly to confirm the participant stayed silent instead of publishing an
+	// aggregate on a PR with no managed schema changes.
+	select {
+	case <-filesFetched:
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for participant auto-plan discovery")
+	}
 	select {
 	case cr := <-checkRuns:
 		t.Fatalf("participant posted a check run on a non-schema PR: %q", cr.Name)
@@ -1151,7 +1161,7 @@ func TestE2EPassingAggregateOnSQLWithoutSchemabotYAML(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	// Should post passing aggregate even though .sql files changed
 	select {
@@ -1229,7 +1239,7 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	// Single-instance mode posts a global "SchemaBot" passing aggregate
 	select {

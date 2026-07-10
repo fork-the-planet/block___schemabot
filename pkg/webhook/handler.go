@@ -542,7 +542,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleCheckRun(ctx, w, body)
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	case "pull_request":
-		h.handlePullRequest(ctx, metricApp, w, body)
+		h.handlePullRequest(ctx, metricApp, w, body, r.Header.Get(headerDeliveryID))
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	case "merge_group":
 		h.handleMergeGroup(ctx, metricApp, w, body)
@@ -764,7 +764,7 @@ func verifyHMAC(signature string, body, secret []byte) bool {
 func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
 	if r := recover(); r != nil {
 		stack := debug.Stack()
-		h.logger.Error("goroutine panic", "error", r, "stack", string(stack))
+		h.logger.Error("goroutine panic", "repo", repo, "pr", pr, "installation_id", installationID, "error", r, "stack", string(stack))
 		h.postComment(repo, pr, installationID,
 			fmt.Sprintf("**Internal error: goroutine panic. This is a bug — please report it.**\n```\n%v\n```", r))
 	}

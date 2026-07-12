@@ -379,6 +379,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		InstallationID: installationID,
 		DeferCutover:   options["defer_cutover"] == "true",
 		SupportChannel: h.supportChannel(),
+		Tenant:         h.deploymentTenant(),
 		Logger:         h.logger,
 		OnTerminalHook: func(a *storage.Apply) {
 			// refreshChecksForTerminalApply routes a completed rollback straight
@@ -453,7 +454,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 	// Post initial progress comment for the observer to edit. VSchema status is
 	// omitted on this first comment — the observer refreshes it from engine
 	// display metadata on the next progress tick.
-	progressBody := formatProgressComment(apply, nil, nil)
+	progressBody := formatProgressComment(apply, nil, nil, h.deploymentTenant())
 	h.postInitialProgressComment(ctx, repo, pr, installationID, applyID, progressBody)
 }
 

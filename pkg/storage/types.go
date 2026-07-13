@@ -1099,6 +1099,21 @@ type ApplyComment struct {
 	// GitHubCommentID is the GitHub comment ID for editing.
 	GitHubCommentID int64
 
+	// PostedVolume records the apply's volume level at the moment a progress
+	// comment was posted. The observer compares it against the apply's current
+	// level to detect an applied volume change and rotate in a fresh progress
+	// comment. Nil for comment states where the level is not meaningful and
+	// for rows that predate volume tracking — nil never triggers a rotation.
+	PostedVolume *int
+
+	// PendingFreezeCommentID records the GitHub comment ID of a progress
+	// comment this row's comment superseded whose frozen rendering has not yet
+	// landed on GitHub. It is written in the same upsert that tracks the
+	// successor, so a failed freeze edit (or a pod dying before it) leaves a
+	// durable marker any later observer can reconcile; it is cleared once the
+	// freeze lands. Nil means no freeze is owed.
+	PendingFreezeCommentID *int64
+
 	// EditCount tracks how many times this comment was edited.
 	EditCount int
 

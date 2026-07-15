@@ -11,6 +11,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Meter name used for all SchemaBot metrics.
@@ -1145,6 +1147,68 @@ func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType
 	addCounter(ctx, "schemabot.webhook.unregistered_repository_ignored_total",
 		"Total number of GitHub webhook events ignored because the repository is not configured", "{event}",
 		attrs...)
+}
+
+// knownWebhookInboxStates allowlists the canonical durable webhook inbox states
+// so the depth gauge's cardinality stays bounded. It is derived from the
+// storage state list so the two cannot drift; an unrecognized value is folded to
+// "unknown".
+var knownWebhookInboxStates = func() map[string]bool {
+	states := make(map[string]bool, len(storage.WebhookEventStatesAll))
+	for _, state := range storage.WebhookEventStatesAll {
+		states[state] = true
+	}
+	return states
+}()
+
+// RecordWebhookInboxDepth records the number of durable webhook inbox rows in a
+// given state. A rising pending/processing depth means dispatch is falling
+// behind ingestion; a rising failed_retryable depth means deliveries are
+// retrying; a rising completed/failed depth means terminal rows are accumulating
+// and retention has not reclaimed them.
+func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
+	if !knownWebhookInboxStates[state] {
+		state = "unknown"
+	}
+	recordGauge(ctx, "schemabot.webhook.inbox_depth", count,
+		"Number of durable webhook inbox rows by state", "{row}",
+		EnvironmentAttribute(""),
+		attribute.String("state", state),
+	)
+}
+
+// RecordWebhookInboxOldestClaimableAge records how long the oldest
+// ready-to-claim-but-unclaimed inbox row has been waiting, in seconds. It is the
+// inbox's backlog latency: a value climbing past the dispatch cadence means work
+// is acked but not being picked up.
+func RecordWebhookInboxOldestClaimableAge(ctx context.Context, age time.Duration) {
+	recordGauge(ctx, "schemabot.webhook.inbox_oldest_claimable_age_seconds", int64(age.Seconds()),
+		"Age in seconds of the oldest ready-to-claim durable webhook inbox row", "s",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordWebhookInboxStuckProcessing records the number of inbox rows wedged in
+// processing with an expired lease at the attempt cap — deliveries no driver can
+// reclaim. A nonzero value means auto-plans are being lost to crashes
+// mid-processing until the reconciler terminalizes them.
+func RecordWebhookInboxStuckProcessing(ctx context.Context, count int64) {
+	recordGauge(ctx, "schemabot.webhook.inbox_stuck_processing", count,
+		"Number of durable webhook inbox rows stuck in processing past the attempt cap", "{row}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordWebhookInboxStatsCollectionFailure counts failed inbox snapshots. The
+// inbox depth/backlog gauges are last-value instruments, so a failed snapshot
+// leaves them frozen at their last-good values — indistinguishable from a
+// healthy inbox. This counter is the liveness signal for the gauges: a nonzero
+// rate means the depth/backlog/stuck values are stale and must not be trusted.
+func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
+	addCounter(ctx, "schemabot.webhook.inbox_stats_collection_failures",
+		"Total number of failed durable webhook inbox metric snapshots", "{failure}",
+		EnvironmentAttribute(""),
+	)
 }
 
 var knownStatusCheckOperations = map[string]bool{

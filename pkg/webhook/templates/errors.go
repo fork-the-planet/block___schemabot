@@ -8,9 +8,21 @@ import (
 
 // SchemaErrorData contains data for rendering schema request error comments.
 type SchemaErrorData struct {
-	RequestedBy        string
-	Timestamp          string
-	Environment        string
+	// RequestedBy is the GitHub login that issued the command. Empty means the
+	// command was system-triggered (an auto-plan from a pull request update).
+	RequestedBy string
+	Timestamp   string
+	// Environment is the single environment the command targeted. Empty means
+	// the command was not scoped to one environment: multi-environment plans
+	// (including auto-plans) target every configured environment.
+	Environment string
+	// Environments is the set of environments this SchemaBot deployment
+	// handles, rendered when Environment is empty. In a multi-deployment
+	// topology each deployment is scoped to its own environments, so this
+	// names the concrete environments the failed command covered. Empty means
+	// the deployment is unscoped and the header omits the environment segment
+	// rather than rendering filler.
+	Environments       []string
 	DatabaseName       string
 	SchemaPath         string
 	CommandName        string // "plan" or "apply"
@@ -18,11 +30,58 @@ type SchemaErrorData struct {
 	AvailableDatabases string
 }
 
+// EnvironmentHeader renders the environment header segment: the single
+// environment the command targeted, or the deployment's environment scope
+// when the command spanned environments (multi-environment plans, including
+// auto-plans). Returns "" when neither is known so templates drop the
+// segment — never an empty code span or a vague placeholder.
+func (d SchemaErrorData) EnvironmentHeader() string {
+	if d.Environment != "" {
+		return "**Environment**: " + markdownInlineCode(d.Environment)
+	}
+	switch len(d.Environments) {
+	case 0:
+		return ""
+	case 1:
+		return "**Environment**: " + markdownInlineCode(d.Environments[0])
+	default:
+		quoted := make([]string, len(d.Environments))
+		for i, name := range d.Environments {
+			quoted[i] = markdownInlineCode(name)
+		}
+		return "**Environments**: " + strings.Join(quoted, ", ")
+	}
+}
+
+// ExampleEnvironment is the -e value rendered inside pasteable usage
+// examples: the requested environment when one was given, the deployment's
+// sole environment when it is scoped to exactly one, otherwise a placeholder
+// for the reader to fill in.
+func (d SchemaErrorData) ExampleEnvironment() string {
+	if d.Environment != "" {
+		return d.Environment
+	}
+	if len(d.Environments) == 1 {
+		return d.Environments[0]
+	}
+	return "<environment>"
+}
+
+// Attribution renders the footer attribution line: the requesting user for
+// user-issued commands, or the automatic trigger for system-issued ones —
+// never a bare @ mention.
+func (d SchemaErrorData) Attribution() string {
+	if d.RequestedBy == "" {
+		return "*Triggered automatically by a pull request update at " + d.Timestamp + " UTC*"
+	}
+	return "*Requested by @" + d.RequestedBy + " at " + d.Timestamp + " UTC*"
+}
+
 const databaseNotFoundTemplate = `## ⚠️ Database Not Found
 
-**Database**: ` + "`{{.DatabaseName}}`" + ` | **Environment**: ` + "`{{.Environment}}`" + `
+**Database**: ` + "`{{.DatabaseName}}`" + `{{with .EnvironmentHeader}} | {{.}}{{end}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{.Attribution}}
 
 No ` + "`schemabot.yaml`" + ` configuration with ` + "`database: {{.DatabaseName}}`" + ` was found in this repository.
 
@@ -30,9 +89,9 @@ Check that your ` + "`schemabot.yaml`" + ` file has the correct ` + "`database`"
 
 const invalidConfigTemplate = `## ⚠️ No Valid SchemaBot Configuration Found
 
-**Environment**: ` + "`{{.Environment}}`" + `
+{{with .EnvironmentHeader}}{{.}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{end}}{{.Attribution}}
 
 The ` + "`schemabot.yaml`" + ` file must include ` + "`database`" + ` and ` + "`type`" + ` fields:
 
@@ -46,9 +105,9 @@ type: mysql
 
 const noConfigNoDatabaseTemplate = `## ℹ️ No SchemaBot Configuration Found
 
-**Environment**: ` + "`{{.Environment}}`" + `
+{{with .EnvironmentHeader}}{{.}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{end}}{{.Attribution}}
 
 No ` + "`schemabot.yaml`" + ` configuration file was found in this repository.
 
@@ -64,14 +123,14 @@ type: mysql
 Use the ` + "`-d`" + ` flag to specify which database to {{.CommandName}}:
 
 ` + "```" + `
-schemabot {{.CommandName}} -e {{.Environment}} -d <database-name>
+schemabot {{.CommandName}} -e {{.ExampleEnvironment}} -d <database-name>
 ` + "```" + ``
 
 const noConfigWithDatabaseTemplate = `## ℹ️ No SchemaBot Configuration Found
 
-**Database**: ` + "`{{.DatabaseName}}`" + ` | **Environment**: ` + "`{{.Environment}}`" + `
+**Database**: ` + "`{{.DatabaseName}}`" + `{{with .EnvironmentHeader}} | {{.}}{{end}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{.Attribution}}
 
 No ` + "`schemabot.yaml`" + ` configuration file exists in this repository.
 
@@ -85,9 +144,9 @@ type: mysql
 
 const configOutsideAllowedDirsTemplate = `## ⚠️ SchemaBot Configuration Not Authorized
 
-**Database**: ` + "`{{.DatabaseName}}`" + ` | **Environment**: ` + "`{{.Environment}}`" + `
+**Database**: ` + "`{{.DatabaseName}}`" + `{{with .EnvironmentHeader}} | {{.}}{{end}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{.Attribution}}
 
 SchemaBot found a ` + "`schemabot.yaml`" + ` configuration, but this SchemaBot instance is not configured to manage its schema directory.
 
@@ -97,9 +156,9 @@ Ask a SchemaBot operator to add this directory to ` + "`databases.{{.DatabaseNam
 
 const multipleConfigsTemplate = `## ⚠️ Multiple Databases Detected
 
-**Environment**: ` + "`{{.Environment}}`" + `
+{{with .EnvironmentHeader}}{{.}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{end}}{{.Attribution}}
 
 This repository has multiple ` + "`schemabot.yaml`" + ` configurations.
 
@@ -112,14 +171,14 @@ This repository has multiple ` + "`schemabot.yaml`" + ` configurations.
 Use the ` + "`-d`" + ` flag:
 
 ` + "```" + `
-schemabot {{.CommandName}} -e {{.Environment}} -d <database-name>
+schemabot {{.CommandName}} -e {{.ExampleEnvironment}} -d <database-name>
 ` + "```" + ``
 
 const genericErrorTemplate = `## ❌ {{.CommandName}} Failed
 
-**Environment**: ` + "`{{.Environment}}`" + `
+{{with .EnvironmentHeader}}{{.}}
 
-*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+{{end}}{{.Attribution}}
 
 ### Error
 

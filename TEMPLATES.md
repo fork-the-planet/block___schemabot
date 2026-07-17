@@ -5508,6 +5508,23 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="base-schema-changed-since-pr-diverged"></a><strong>Base Schema Changed Since PR Diverged</strong></summary>
+
+
+## ⚠️ Apply rejected — base schema is newer — Production
+
+**Database**: `testapp`
+
+The base branch contains newer changes to the schema directory `schema/testapp` that are not included in this PR. Applying this branch could revert those changes.
+
+Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.
+
+_Requested by @jackjackbits_
+
+
+</details>
+
+<details>
 <summary><a name="blocked-by-prior-env-pending"></a><strong>Blocked By Prior Env (Pending)</strong></summary>
 
 

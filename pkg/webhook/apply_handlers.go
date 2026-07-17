@@ -226,19 +226,15 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		h.logger.Error("failed to fetch PR for stale-schema check, releasing lock",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", prErr)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to verify PR HEAD before apply: "+prErr.Error())
-		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
-		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
-			h.logger.Error("failed to release lock after PR fetch failure",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
-		}
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "PR freshness fetch failure")
 		return
 	}
 	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, prInfo.HeadSHA, environment, requestedBy, action.Apply); rejected {
-		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
-		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
-			h.logger.Error("failed to release lock after stale-schema rejection",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
-		}
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "stale-schema rejection")
+		return
+	}
+	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, prInfo, environment, requestedBy, action.Apply); rejected {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "base-schema freshness rejection")
 		return
 	}
 
@@ -249,21 +245,11 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	// transitioned to failing on the same SHA (e.g. CI re-ran red, or a
 	// new required check was added) would otherwise sneak past. Release
 	// the lock on block so the user can re-run `schemabot apply -e <env>`
-	// once the checks recover, without a manual unlock.
-	//
-	// Use owner-scoped Release rather than ForceRelease: although this
-	// handler invocation acquired the lock earlier, ownership can change
-	// between acquisition and this point (e.g. `schemabot unlock` clears
-	// the lock and another PR acquires it). Release deletes only when
-	// owner matches; ErrLockNotFound / ErrLockNotOwned are expected here
-	// (lock may be absent or now held by another PR) and are not logged
-	// as errors.
+	// once the checks recover, without a manual unlock. The release is keyed
+	// on the (owner, pending plan) intent acquired above, so a lock that has
+	// since changed hands or been re-pinned is preserved.
 	if blocked := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment); blocked {
-		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
-		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
-			h.logger.Error("failed to release lock after fresh-HEAD checks gate block",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
-		}
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "fresh-HEAD checks gate block")
 		return
 	}
 
@@ -296,7 +282,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID)
 }
 
 // handleApplyConfirmCommand handles the "schemabot apply-confirm -e <env>" PR comment command.
@@ -357,26 +343,6 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		return
 	}
 
-	// Reject if the PR HEAD advanced after discovery loaded schema files.
-	// Running against the loaded files would render a plan against an older
-	// commit than the branch is on right now. Release the lock so the user
-	// can re-run `schemabot apply -e <env>` cleanly.
-	//
-	// Use owner-scoped Release rather than ForceRelease: this handler runs on
-	// every PR comment, so a stale-schema rejection on PR #2 must never clear
-	// a lock held by PR #1 for the same target. Release deletes only when
-	// owner matches; ErrLockNotFound / ErrLockNotOwned are expected here
-	// (lock may be absent or held by another PR) and are not logged as errors.
-	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, confirmPRInfo.HeadSHA, environment, requestedBy, action.ApplyConfirm); rejected {
-		lockOwner := fmt.Sprintf("%s#%d", repo, pr)
-		relErr := h.service.Storage().Locks().Release(ctx, schemaResult.Database, schemaResult.Type, lockOwner)
-		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
-			h.logger.Error("failed to release lock after stale-schema rejection",
-				"repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type, "error", relErr)
-		}
-		return
-	}
-
 	if blocked := h.enforcePassingChecks(ctx, client, repo, pr, installationID, confirmPRInfo.HeadSHA, environment); blocked {
 		return
 	}
@@ -402,6 +368,40 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		h.postComment(repo, pr, installationID, templates.RenderApplyConfirmNoLock(database, environment))
 		return
 	}
+	// A same-PR rollback lock uses the same owner string but is confirmed via
+	// rollback-confirm, never here. Reject it before the freshness checks so no
+	// rejection path below can release it.
+	if existingLock.Owner == lockOwner && strings.HasPrefix(existingLock.PendingPlanID, rollbackPendingPlanPrefix) {
+		h.logger.Info("apply-confirm rejected: lock belongs to rollback plan", "repo", repo, "pr", pr,
+			"database", database, "environment", environment, "pending_plan_id", existingLock.PendingPlanID)
+		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
+			"This lock belongs to a rollback plan. Use `schemabot rollback-confirm` to execute it, or `schemabot unlock` to cancel it.")
+		return
+	}
+
+	// Freshness rejections outrank the lock-conflict comment: a stale branch
+	// needs a rebase no matter who holds the lock. Release only when this PR
+	// owns the lock, keyed on the pending intent observed above, so another
+	// PR's lock — or this PR's lock re-pinned by a newer plan mid-check — is
+	// never removed.
+	releaseObservedApplyIntent := func(reason string) {
+		if existingLock.Owner != lockOwner {
+			h.logger.Info("left apply lock in place after pre-execution rejection because another PR holds it",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "reason", reason, "lock_owner", existingLock.Owner)
+			return
+		}
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, existingLock.PendingPlanID, reason)
+	}
+	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, confirmPRInfo.HeadSHA, environment, requestedBy, action.ApplyConfirm); rejected {
+		releaseObservedApplyIntent("stale-schema rejection")
+		return
+	}
+	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, confirmPRInfo, environment, requestedBy, action.ApplyConfirm); rejected {
+		releaseObservedApplyIntent("base-schema freshness rejection")
+		return
+	}
+
 	if existingLock.Owner != lockOwner {
 		h.logger.Info("apply-confirm blocked by lock conflict", "repo", repo, "pr", pr, "database", database, "lock_owner", existingLock.Owner)
 		h.postComment(repo, pr, installationID, templates.RenderApplyBlockedByOtherPR(templates.ApplyLockConflictData{
@@ -413,13 +413,6 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 			LockPR:      existingLock.PullRequest,
 			LockCreated: existingLock.CreatedAt,
 		}))
-		return
-	}
-	if strings.HasPrefix(existingLock.PendingPlanID, rollbackPendingPlanPrefix) {
-		h.logger.Info("apply-confirm rejected: lock belongs to rollback plan", "repo", repo, "pr", pr,
-			"database", database, "environment", environment, "pending_plan_id", existingLock.PendingPlanID)
-		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
-			"This lock belongs to a rollback plan. Use `schemabot rollback-confirm` to execute it, or `schemabot unlock` to cancel it.")
 		return
 	}
 	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
@@ -438,12 +431,9 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	// land in the same plans table and can supersede the confirmation plan a
 	// reviewer is about to confirm.
 	//
-	// Use owner-scoped Release rather than ForceRelease even though the
-	// ownership check above just succeeded: ownership can change between that
-	// Get and this delete (intervening unlock/reacquire by another PR), and
-	// ForceRelease would clear the new owner's lock. Release deletes only when
-	// owner still matches; ErrLockNotFound / ErrLockNotOwned are expected if
-	// ownership has already changed and are not logged as errors.
+	// The rejection release is keyed on the (owner, pending plan) intent
+	// observed above, so a lock that has since changed hands or been re-pinned
+	// by a newer plan is preserved.
 	storedPlan, planLoadErr := h.confirmationPlanForLock(ctx, existingLock)
 	if planLoadErr != nil {
 		h.logger.Error("failed to load confirmation plan for cross-delivery freshness check",
@@ -453,15 +443,11 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		return
 	}
 	if rejected := h.assertPlanStillCurrent(ctx, repo, pr, installationID, storedPlan, confirmPRInfo.HeadSHA, environment, requestedBy); rejected {
-		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
-		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
-			h.logger.Error("failed to release lock after stale-plan rejection",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
-		}
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, existingLock.PendingPlanID, "stale-plan rejection")
 		return
 	}
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID)
 }
 
 // handleUnlockCommand handles the "schemabot unlock" PR comment command.

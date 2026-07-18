@@ -2952,6 +2952,7 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			storedTask.RowsCopied = remoteTask.RowsCopied
 			storedTask.RowsTotal = remoteTask.RowsTotal
 			storedTask.ProgressPercent = int(remoteTask.PercentComplete)
+			storedTask.ETASeconds = int(remoteTask.EtaSeconds)
 			storedTask.ChecksumRowsChecked = remoteTask.ChecksumRowsChecked
 			storedTask.ChecksumRowsTotal = remoteTask.ChecksumRowsTotal
 		}
